@@ -8,6 +8,15 @@
 --
 -- Requires PostgreSQL 18+ (for native uuidv7()).
 
+-- Loud-fail on PG < 18 instead of cryptic "function uuidv7() does not exist".
+DO $$
+BEGIN
+    IF current_setting('server_version_num')::int < 180000 THEN
+        RAISE EXCEPTION 'pgwq requires PostgreSQL 18+ (uuidv7() native), got %',
+            current_setting('server_version');
+    END IF;
+END$$;
+
 CREATE SCHEMA IF NOT EXISTS pgwq;
 
 -- updated_at touch trigger function, namespaced to pg_work_queue (not public)
@@ -41,7 +50,11 @@ CREATE TABLE pgwq.jobs (
     -- Opaque blob — codec lives in app; library does not introspect payload.
     payload            BYTEA       NOT NULL,
     status             pgwq.job_status NOT NULL DEFAULT 'queued',
-    attempts           SMALLINT    NOT NULL DEFAULT 0,
+    -- INTEGER (not SMALLINT) — builder accepts max_attempts: u32, overflow
+    -- at i16::MAX (32767) would otherwise be reachable + cause numeric_value_
+    -- out_of_range in claim_batch's `attempts = j.attempts + 1`, putting the
+    -- row in a stuck-running loop the reaper can't recover.
+    attempts           INTEGER     NOT NULL DEFAULT 0,
     -- Fencing token: set by claim_batch via gen_random_uuid (v4 — no time leak,
     -- ephemeral, never indexed). Cleared on every transition out of 'running'.
     -- Required for mark_done/retry/dead WHERE clauses to prevent the
@@ -59,6 +72,14 @@ CREATE TABLE pgwq.jobs (
 
     CONSTRAINT jobs_queue_nonempty
         CHECK (length(queue) > 0),
+    -- Defense-in-depth backstops; library also validates pre-INSERT and
+    -- truncates on write. DB CHECK catches buggy clients bypassing the lib.
+    CONSTRAINT jobs_queue_max_len
+        CHECK (length(queue) <= 64),
+    CONSTRAINT jobs_payload_max_size
+        CHECK (octet_length(payload) <= 1048576),  -- 1 MiB; matches limits::MAX_PAYLOAD_BYTES
+    CONSTRAINT jobs_last_error_max_len
+        CHECK (last_error IS NULL OR length(last_error) <= 8192),  -- matches limits::MAX_LAST_ERROR_LEN
     CONSTRAINT jobs_attempts_nonneg
         CHECK (attempts >= 0),
     -- Temporal monotonicity. Catches reordering bugs in claim/mark/reap paths.
@@ -121,9 +142,9 @@ CREATE INDEX jobs_reap_idx
     ON pgwq.jobs (last_attempted_at)
     WHERE status = 'running';
 
--- Retention sweeper hot path. Two different TTLs (done_retention vs
--- dead_retention) but same index serves both — both DELETE WHERE
--- finished_at < ... AND status = ...
+-- Purge functions hot path. `pgwq::purge_done(pool, age)` and
+-- `pgwq::purge_dead(pool, age)` are user-invoked (no auto-sweeper); both
+-- DELETE WHERE status = ? AND finished_at < now() - ?.
 CREATE INDEX jobs_terminal_idx
     ON pgwq.jobs (finished_at)
     WHERE status IN ('done', 'dead');

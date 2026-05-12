@@ -127,14 +127,6 @@ zawołany ≥1 raz dla tego samego logicznego jobu. Konkretnie:
   side-effect już się wykonał. Reaper-spawned retry wykonuje go ponownie.
 - Worker proces crashuje po handler success ale przed `mark_done`
   commit → reaper recovery, nowy worker retry.
-- **Pułapka:** udany handler z `mark_done` fenced-out po `lease_timeout`
-  → row flipnięty do `awaiting_retry` z `attempts` już inkrementowanym
-  → kolejny worker re-execute → jeśli `attempts >= max_attempts` przy
-  drugiej próbie skończy `dead` mimo że **pierwszy run się powiódł
-  externally**. Dead-letter `tracing::error!` w tym przypadku jest mylący
-  (job wykonany, ale system tego nie zarejestrował). Mitigacja: ustaw
-  `lease_timeout >> p99 handler duration` żeby fenced-out był rzadkością.
-  Statystyka `Stats::fenced_out` policzy te zdarzenia.
 
 ### Handler-side idempotency contract
 
@@ -271,9 +263,9 @@ ekspozuje intencję (use this for dedup). Handler używa `idempotency_key`.
 |---|---|---|---|
 | `queue(&str)` | required | non-empty, ≤ 64 chars | nazwa queue |
 | `poll_interval(Duration)` | 1s | ≥ 10 ms | deterministyczny cycle |
-| `concurrency(usize)` | num_cpus | 1..=(pool.size - 3) | max parallel handlers; **+3 reserved** for poll/reaper/mark queries |
+| `concurrency(usize)` | num_cpus | 1..=pool.size | max parallel handlers |
 | `max_attempts(u32)` | 3 | ≥ 1, ≤ `i32::MAX` | przed dead-letter |
-| `lease_timeout(Duration)` | 5min | ≥ 1s, ≥ poll_interval × 5 | stale-running threshold; **set ≥ p99 handler duration × 3** (warn! issued if < 10s) |
+| `lease_timeout(Duration)` | 5min | ≥ poll_interval × 5 | stale-running threshold |
 | `reaper_interval(Duration)` | lease_timeout/4 | ≥ 1s, ≤ lease_timeout/2 | reaper tick cadence |
 | `batch_size(usize)` | 10 | 1..=1_000 | rows per claim_batch |
 | `retry_backoff(BackoffPolicy)` | `Exponential { 1s, 2.0, 5min, 0.2 }` | jitter ∈ [0,1], cap ≤ 24h | used when `JobError::Retry { retry_in: None, .. }` |
@@ -303,14 +295,8 @@ pub mod limits {
     /// Minimum poll_interval allowed in builder.
     pub const MIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-    /// Reaper sweep batch size (rows per tick). 256 vs 1000 — 1000 może
-    /// hit `max_locks_per_transaction` (default 64) na heavy concurrent reapers
-    /// (N1 z review). 256 safe.
-    pub const REAPER_BATCH_SIZE: usize = 256;
-
-    /// Aggregate cap na całkowity batch payload bytes — chroni przed
-    /// 10k items × 1 MiB = 10 GB single transaction (S3 z review).
-    pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+    /// Reaper sweep batch size (rows per tick).
+    pub const REAPER_BATCH_SIZE: usize = 1_000;
 
     /// Purge function chunk size (rows per `DELETE ... LIMIT N` iteration).
     pub const PURGE_CHUNK_SIZE: usize = 10_000;
@@ -511,28 +497,21 @@ async fn poll_loop<T>(state: Arc<WorkerState<T>>) {
             Ok(rows) if rows.is_empty() => { drop(permit); continue; }
             Ok(rows) => {
                 tracing::info!(claimed = rows.len(), "batch claimed");
-                // CRITICAL: rows są już `running` w DB z attempts++.
-                // Shutdown podczas spawn loop = abandoned rows do reaper
-                // recovery. Aby tego uniknąć — spawn loop **bez tokio::select
-                // na shutdown**. Bierzemy permity nawet po cancel.
-                // Stratny w time-to-drain (każdy row dostanie handler), ale
-                // semantically correct (każdy claimed row → handler called).
                 let mut iter = rows.into_iter();
                 if let Some(row) = iter.next() {
                     state.tasks.spawn(handle_job(row, state.clone(), permit));
                 }
                 for row in iter {
-                    // Block aż permit dostępny (no shutdown shortcut).
-                    let Ok(p) = state.semaphore.clone().acquire_owned().await
-                        else { break }; // semaphore closed (only when handle drop)
+                    let p = tokio::select! {
+                        r = state.semaphore.clone().acquire_owned() => r,
+                        _ = state.shutdown.cancelled() => return,
+                    };
+                    let Ok(p) = p else { return };
                     state.tasks.spawn(handle_job(row, state.clone(), p));
                 }
-                // Sprawdź shutdown PO spawn'owaniu całego batch'a.
-                if state.shutdown.is_cancelled() { break; }
             }
             Err(e) if is_fatal_sqlx(&e) => {
                 tracing::error!(error = %e, "fatal DB error in claim_batch; shutting down worker");
-                state.last_fatal.lock().get_or_insert_with(|| Arc::new(e));
                 state.shutdown.cancel();
                 break;
             }
@@ -584,39 +563,33 @@ mieć dodatkowy guard). v2 łączy w jeden CTE z `CASE WHEN`:**
 ```sql
 WITH stale AS (
     SELECT id, attempts FROM pgwq.jobs
-    WHERE queue = $1                          -- per-queue isolation
-      AND status = 'running'
-      AND last_attempted_at < now() - $2::interval
+    WHERE status = 'running'
+      AND last_attempted_at < now() - $1::interval
     ORDER BY last_attempted_at
-    LIMIT $3
+    LIMIT $2
     FOR UPDATE SKIP LOCKED
 )
 UPDATE pgwq.jobs j
 SET status = CASE
-        WHEN s.attempts >= $4 THEN 'dead'::pgwq.job_status
+        WHEN s.attempts >= $3 THEN 'dead'::pgwq.job_status
         ELSE 'awaiting_retry'::pgwq.job_status
     END,
     finished_at = CASE
-        WHEN s.attempts >= $4 THEN now()
+        WHEN s.attempts >= $3 THEN now()
         ELSE NULL
     END,
     last_error = COALESCE(j.last_error, CASE
-        WHEN s.attempts >= $4 THEN 'lease_expired_max_attempts'
+        WHEN s.attempts >= $3 THEN 'lease_expired_max_attempts'
         ELSE 'lease_expired'
     END),
     lease_token = NULL
 FROM stale s
 WHERE j.id = s.id
-  AND j.status = 'running'                    -- defense-in-depth (matches partial index)
-RETURNING j.id, j.public_id, j.status, j.attempts;
+RETURNING j.id, j.status, j.attempts;
 ```
 
 Atomic single-statement. SKIP LOCKED w CTE = stale rows trzymane workerem
-nie są reapowane. Brak race window. **`queue = $1`** krytyczne — bez tego
-Worker A (queue=`email`, lease_timeout=30s) mógłby reapować długo-running
-joba Worker B (queue=`billing`, handler trwa 10min). Plus N replik tej
-samej kolejki → SKIP LOCKED naturalnie partycjonuje, ale każdy widzi
-tylko swój queue.
+nie są reapowane. Brak race window.
 
 Reaper task:
 
@@ -645,22 +618,13 @@ async fn reaper_loop(state: Arc<WorkerState>) {
                     reaped_retry = retry_count,
                     "stale jobs reaped"
                 );
-                // Per-row pgwq.state.transition events tak samo jak
-                // handler-driven. source="reaper" w attrs.
                 for row in &reaped {
-                    let to = if row.status == "dead" { "dead" } else { "awaiting_retry" };
-                    emit_transition(
-                        TransitionFrom::Running,
-                        if to == "dead" { TransitionTo::Dead } else { TransitionTo::AwaitingRetry },
-                        TransitionCtx {
-                            job_id: row.id,
-                            public_id: row.public_id,
-                            queue: &state.queue,
-                            attempts: row.attempts,
-                            source: "reaper",
-                            reason: Some(if to == "dead" { "lease_expired_max_attempts" } else { "lease_expired" }),
-                        },
-                    );
+                    if row.status == "dead" {
+                        tracing::error!(
+                            job.id = row.id, job.attempts = row.attempts,
+                            "job dead-lettered (lease expired, max_attempts exhausted)"
+                        );
+                    }
                 }
             }
             Err(e) if is_fatal_sqlx(&e) => {
@@ -676,47 +640,8 @@ async fn reaper_loop(state: Arc<WorkerState>) {
 }
 ```
 
-### Reaper panic recovery
-
-**Decyzja (W10 z review):** reaper tick wrapped w `AssertUnwindSafe(...).catch_unwind()`
-— per-tick panic isolated, log + counter, **escalate do worker shutdown
-po K=3 consecutive ticki z panic**:
-
-```rust
-const REAPER_PANIC_ESCALATION_THRESHOLD: u32 = 3;
-
-let mut consecutive_panics = 0;
-loop {
-    let result = AssertUnwindSafe(async {
-        reap(&state.pool, &state.queue, ...).await
-    }).catch_unwind().await;
-
-    match result {
-        Ok(Ok(reaped)) => { consecutive_panics = 0; emit_events(&reaped); }
-        Ok(Err(e)) if is_fatal_sqlx(&e) => {
-            state.last_fatal.lock().get_or_insert_with(|| Arc::new(e));
-            state.shutdown.cancel();
-            return;
-        }
-        Ok(Err(e)) => { consecutive_panics = 0; tracing::warn!(error = %e, "reap tick failed"); }
-        Err(panic_payload) => {
-            consecutive_panics += 1;
-            let msg = extract_panic_message(&panic_payload);
-            tracing::error!(panic = %msg, consecutive = consecutive_panics,
-                "reaper tick panicked");
-            if consecutive_panics >= REAPER_PANIC_ESCALATION_THRESHOLD {
-                tracing::error!(threshold = REAPER_PANIC_ESCALATION_THRESHOLD,
-                    "reaper exceeded panic threshold; shutting down worker");
-                state.shutdown.cancel();
-                return;
-            }
-        }
-    }
-}
-```
-
-Test: `tests/reaper_recovers_from_tick_panic.rs` (inject panic via test-only
-hook, assert worker survives ≤2 panics, dies on 3rd).
+Reaper task wrapped w `JoinSet::spawn` z `tracing::error!` na panic via
+`JoinError`.
 
 ### Mark queries (fencing token w WHERE)
 
@@ -742,21 +667,14 @@ WHERE id = $1
 **0-rows-affected reactions** (explicit):
 
 - `mark_done` 0 rows → reaper już flipnął (lease expired) lub szczególny
-  race. Action: `warn!(job.id, idempotency_key, "mark_done lost race —
-  side-effect may have already been retried by other worker")`, increment
-  `Stats::fenced_out`, emit structured event `pgwq.state.transition` z
-  `lost_race=true` attr. Worker continues — next claim picks up.
-- `mark_retry` 0 rows → analogously. `warn!` + `fenced_out++`. Continue.
-- `mark_dead` 0 rows → analogously. `warn!` + `fenced_out++`. Continue.
+  race. Log `warn!(job.id, idempotency_key, "mark_done lost race — side-effect
+  may have already been retried by other worker")`. Worker continues —
+  next claim picks up.
+- `mark_retry` 0 rows → analogously. `warn!`. Continue.
+- `mark_dead` 0 rows → analogously. `warn!`. Continue.
 
 W żadnym wypadku worker NIE re-attempts; reaper-spawned retry przejmuje
 dalszą logikę.
-
-**Edge case dokumentowany w § Delivery semantics:** udany handler z
-mark_done fenced-out → kolejny retry → może skończyć `dead` jeśli
-`attempts >= max_attempts`. Dead-letter `tracing::error!` jest mylący
-w tym przypadku — system widzi failure ale externally side-effect
-zaszedł. `Stats::fenced_out` umożliwia detekcję.
 
 ### Manual cleanup — `pgwq::purge_*`
 
@@ -796,30 +714,22 @@ tracing::info!(status = %status, age = ?age, deleted = total, "purge complete");
 ### Batch push
 
 ```sql
--- run_at omitted — DB DEFAULT now() fires per row.
-INSERT INTO pgwq.jobs (queue, payload, public_id)
-SELECT $1, payload, public_id
-FROM unnest($2::bytea[], $3::uuid[]) WITH ORDINALITY AS u(payload, public_id, ord)
-ORDER BY ord
+INSERT INTO pgwq.jobs (queue, payload, public_id, run_at)
+SELECT $1, unnest($2::bytea[]), unnest($3::uuid[]),
+       COALESCE(unnest($4::timestamptz[]), now())
+ORDER BY ordinality
 RETURNING id, public_id;
 ```
 
 `Pusher` client-side:
-1. Validate `items.len() > 0 && items.len() <= limits::MAX_BATCH_SIZE` →
-   else `PushError::BatchTooLarge { size, max }` lub `BatchEmpty`.
-2. Encode loop **short-circuited**: encode item i → validate
-   `payload.len() <= MAX_PAYLOAD_BYTES` (else
-   `PushError::PayloadTooLarge { index: i, size, max }`) → accumulate
-   `total_bytes`; jeśli `total_bytes > MAX_BATCH_BYTES` → bail z
-   `PushError::BatchPayloadTooLarge { total_bytes, max }`. Bez tego
-   5 GB transient buffor zanim item 4999 fails.
-3. Generate `public_id = Uuid::now_v7()` per item (client-side dla
-   outbox correlation-in-same-tx; deterministic order).
-4. Single `INSERT...SELECT FROM unnest(...) WITH ORDINALITY` round-trip.
+1. Validate `items.len() <= limits::MAX_BATCH_SIZE` → else `PushError::BatchTooLarge`.
+2. Generate `public_id = Uuid::now_v7()` per item (deterministic ordering;
+   client-side dla outbox correlation-in-same-tx).
+3. Validate `payload.len() <= limits::MAX_PAYLOAD_BYTES` per item → else
+   `PushError::PayloadTooLarge { index, size }`.
+4. Single `INSERT...SELECT unnest()` round-trip.
 
-Return: `Vec<Uuid>` w **input order**. Drugi wariant
-`push_batch_at(tx, &[(T, Option<DateTime<Utc>>)])` jako follow-up
-v0.2 jeśli user supply use case dla per-item scheduled run_at.
+Return: `Vec<Uuid>` w **input order** (zachowane przez `ORDER BY ordinality`).
 
 API:
 
@@ -849,27 +759,6 @@ impl<C: Codec> Pusher<C> {
     ) -> Result<Vec<Uuid>, PushError>;
 }
 ```
-
-### Public API surface (`pub use` w `lib.rs`)
-
-```rust
-pub use crate::backoff::BackoffPolicy;
-pub use crate::codec::{Codec, JsonCodec};
-pub use crate::error::{BuildError, JobError, PurgeError, PushError, ShutdownError};
-pub use crate::pusher::Pusher;
-pub use crate::purge::{purge_dead, purge_done, queue_stats, QueueStats};
-pub use crate::worker::{
-    JobContext, PanicPolicy, Stats, Worker, WorkerBuilder, WorkerHandle,
-};
-
-pub mod limits;  // public module — users reference constants
-
-// Migracja re-export:
-pub fn migrator() -> sqlx::Migrator { sqlx::migrate!("./migrations") }
-```
-
-Bez tego `use pg_work_queue::{Worker, JobError, ...}` w przykładach
-głównych nie skompiluje się (S20 z review).
 
 ### Codec
 
@@ -926,11 +815,8 @@ Jitter ważny przy thundering herd (10 jobs fails równocześnie → bez jittera
 wszystkie wracają w tym samym ticku).
 
 User per-call override: `Err(JobError::Retry { retry_in: Some(d), .. })`.
-**Clamp:** `d ∈ [max(poll_interval, 100ms), 24h]`. Powód dolnego ograniczenia:
-`Duration::ZERO` w retry-loop'ującym handlerze + `poll_interval=10ms` =
-~100×N retries/sec hammering DB (S1 z review). Cliampujemy do co najmniej
-100ms; przy clampie emit `warn!(requested_ms, applied_ms, "retry_in clamped")`.
-Górny clamp 24h zapobiega `Duration::MAX` jako footgun.
+**Cap**: `d` clamp'owany do `[Duration::ZERO, 24h]` żeby nie przyjmować
+`Duration::MAX` jako footgun.
 
 ## Error semantics & handling
 
@@ -957,16 +843,10 @@ pub enum BuildError {
     PollIntervalTooShort { min: Duration },
     #[error("concurrency must be >= 1")]
     ConcurrencyZero,
-    #[error("pool too small: need pool.size >= concurrency + 3 (poll/reaper/mark reservations); have {actual}, need {required}")]
-    PoolTooSmall { actual: u32, required: u32 },
     #[error("max_attempts must be >= 1")]
     MaxAttemptsZero,
-    #[error("lease_timeout must be >= 1s (MIN_LEASE_TIMEOUT)")]
-    LeaseTimeoutBelowFloor,
     #[error("lease_timeout must be >= 5 * poll_interval")]
     LeaseTimeoutTooShort,
-    #[error("lease_timeout + reaper_interval combination impossible: lease={lease:?}, need reaper <= lease/2 but >= 1s, so lease must be >= 2s")]
-    LeaseTimeoutTooShortForReaper { lease: Duration },
     #[error("reaper_interval must be <= lease_timeout / 2")]
     ReaperIntervalTooLong,
     #[error("queue name invalid: {0}")]
@@ -1075,75 +955,27 @@ Pełny handler example z `?`:
 
 Wszystkie user-supplied `reason` strings (`JobError::Retry/Abort`, panic
 message) **truncate'owane na library boundary** do `limits::MAX_LAST_ERROR_LEN`
-**character units** (nie bajtów — Postgres `length(TEXT)` zwraca chars).
-Trim by char boundary safe (rust-safe-string-truncation skill):
+zanim wejdą do `last_error`. Trim by char boundary safe (rust-safe-string-truncation
+skill). DB CHECK na 8 KiB jako backstop.
 
-```rust
-fn trim_reason(s: &str) -> String {
-    s.chars().take(limits::MAX_LAST_ERROR_LEN).collect()
-}
-```
-
-DB CHECK na `length(last_error) <= 8192` jako backstop.
-
-Centralizowane przez `fmt_err_trimmed(e: &dyn Error)`. Wszystkie sites
-(mark_retry reason, mark_dead reason, panic message extraction, codec
-decode error) używają tej samej fn.
-
-### Sensitive data warning
-
-`reason` field w `JobError::Retry/Abort` jest **persisted w `last_error`
-column + emitted via `tracing::warn!`**. Library nie sanitizuje. Handlers
-muszą uważać:
-
-- `e.to_string()` może zawierać connection strings, API tokens, fragmenty
-  payload, PII (HIPAA/GDPR).
-- Recommended pattern: log **full error internally**, pass **opaque
-  category** do `JobError`:
-  ```rust
-  Err(e) => {
-      tracing::error!(job.id = ctx.id, error = ?e, "internal handler error");
-      Err(JobError::retry("internal_error"))  // not e.to_string()
-  }
-  ```
-- Library-side: per-row `state.transition` events z `reason` w demoted
-  do `DEBUG`; `ERROR` level events (dead-letter) zawierają tylko
-  `reason_length: usize` + `reason_present: bool`.
-
-To jest **handler responsibility** — library zapewnia narzędzie, użycie
-jest po stronie usera. Doc-comment na `JobError` warianty będzie miał
-ten warning.
+Także `tracing::warn!(reason = %trim(reason))` — nie logujemy nieograniczonych
+user strings.
 
 ### Sqlx error classification
 
 ```rust
 fn is_fatal_sqlx(e: &sqlx::Error) -> bool {
     matches!(e,
-        // Pool / runtime — no recovery possible.
         sqlx::Error::PoolClosed
         | sqlx::Error::WorkerCrashed
         | sqlx::Error::Configuration(_)
         | sqlx::Error::Migrate(_)
-        // Schema/wire-level — retry won't fix; loud crash forces operator
-        // to redeploy / re-migrate. Apalis anti-pattern was infinite-warn-
-        // loop on missing schema.
-        | sqlx::Error::ColumnDecode { .. }
-        | sqlx::Error::Decode(_)
-        | sqlx::Error::TypeNotFound { .. }
-        | sqlx::Error::ColumnNotFound(_)
-        | sqlx::Error::Protocol(_)
     )
 }
 ```
 
-Fatal → worker self-shutdown via cancellation token, surfaced przez
-`ShutdownError::Fatal(Arc<sqlx::Error>)` w `WorkerHandle::shutdown` result.
-Transient (`Database` / `Io` / `Tls` / `PoolTimedOut`) → `warn!` + retry
-next tick.
-
-`PoolTimedOut` jest **transient** (worker temporarily over-subscribed),
-ale persistent PoolTimedOut suggeruje misconfiguration (W8: concurrency
-+ 3 ≤ pool.size). Logged at `warn!`.
+Fatal → worker self-shutdown via cancellation token. Transient
+(Database / Io / Tls / Protocol) → warn + retry next tick.
 
 ## Observability spec
 
@@ -1233,18 +1065,11 @@ go w `#[tokio::test]` setup.
 
 ```rust
 pub struct Stats {
-    pub completed: u64,       // handlers returned Ok(()) (mark_done ack'd, rows_affected > 0)
-    pub failed: u64,          // handlers returned Err(JobError::Retry/Abort) OR panicked
-    pub aborted: u64,         // handlers aborted via JoinSet::abort_all (timeout)
-    pub fenced_out: u64,      // mark_* returned 0 rows (lease lost to reaper)
-    pub pending_recovery: u64,// rows still 'running' at drain (reaper will recover via lease_timeout)
+    pub completed: u64,    // handlers returned Ok(()) (mark_done ack'd)
+    pub failed: u64,       // handlers returned Err(JobError::Retry/Abort) OR panicked
+    pub aborted: u64,      // handlers aborted via JoinSet::abort_all (timeout)
 }
 ```
-
-Implementacja: `AtomicU64` per field z `Ordering::Relaxed` (one writer
-per field; reader just snapshots at shutdown). `last_fatal: Mutex<Option<Arc<sqlx::Error>>>`
-w `WorkerState` (sqlx::Error nie jest `Clone`; Arc allows surfacing
-przez `ShutdownError::Fatal(Arc<sqlx::Error>)`).
 
 **Aborted handlers semantics:** ich rows zostają `status='running'` z
 aktualnym `lease_token`. Reaper-side recovery (po `lease_timeout`) flipuje
@@ -1363,69 +1188,49 @@ Commit `d9c4dc7`.
 ### Faza 1 — Pusher + codec + migrator
 
 - `Codec` trait + `JsonCodec` impl.
-- `Pusher::new` (fail-late validation queue name → `Result<Self, PusherInitError>`),
-  `with_codec`, `push`, `push_at`, `push_batch`.
+- `Pusher::new`, `with_codec`, `push`, `push_at`, `push_batch`.
 - `pg_work_queue::migrator()` re-export `sqlx::migrate!("./migrations")`.
-- Resource validation (per-item + aggregate batch bytes).
-- `PushError` enum z `BatchPayloadTooLarge` + `BatchCodec { index, source }`
-  + per-item `PayloadTooLarge { index }`.
-- Tests: `migrator_schema.rs`, `migrator_pg17_fails_loud.rs` (S5),
-  `push_batch_throughput.rs`, `push_batch_order_preserved.rs`,
-  `resource_limits_push.rs`, `codec_json_roundtrip.rs`,
-  `codec_swappable.rs`, `truncate_safe_string.rs`.
+- Resource validation (payload size, batch size, queue length).
+- `PushError` enum.
+- Tests: `migrator_schema.rs`, `push_batch_throughput.rs`,
+  `push_batch_order_preserved.rs`, `resource_limits.rs` (push parts).
 
 ### Faza 2 — claim_batch SQL + Job<T> + JobContext
 
 - `claim_batch` SQL function.
-- `pub struct Job<T>` + `pub struct JobContext` (includes idempotency_key).
-- Codec decode na claim time; decode error → mark_dead **z catch_unwind
-  wokół decode call** (custom Codec impl może panicować).
-- Tests: `skip_locked_no_double_claim.rs`, `batch_size_behavior.rs`,
-  `codec_decode_error_marks_dead.rs`, `codec_panic_marks_dead.rs`.
+- `pub struct Job<T>` + `pub struct JobContext`.
+- Codec decode na claim time; decode error → mark_dead.
+- Tests: `skip_locked_no_double_claim.rs`.
 
 ### Faza 3 — single-shot worker + mark queries z fencing
 
 - `Worker::tick_once(...)` — fetch batch, run handlers sequential,
   mark_done/retry/dead z fencing.
-- Library-side char-safe truncation w `last_error` (`fmt_err_trimmed`).
+- Library-side string truncation w `last_error`.
 - `unreachable_pub` guards.
-- Tests: end-to-end smoke, `fencing_token_no_double_run.rs`,
-  `builder_validation.rs` (cross-knob rules), `mark_done_loses_to_reaper.rs`
-  (W6 — fenced_out stat).
+- Tests: end-to-end smoke, `fencing_token_no_double_run.rs`.
 
 ### Faza 4 — poll loop + concurrency + worker identity
 
-- `Worker::start()` → spawn poll loop + JoinSet. Schema check przy
-  `start()` (SELECT 1 FROM pgwq.jobs LIMIT 0).
+- `Worker::start()` → spawn poll loop + JoinSet.
 - `worker.id = Uuid::now_v7()` w span attrs.
-- `CancellationToken` plumbing. Poll loop **kompletuje spawn batch
-  unconditionally** po claim (W9 fix — żeby claimed rows nie były
-  abandoned przy shutdown mid-batch).
-- `is_fatal_sqlx()` classification z schema-level error variants
-  (W3).
+- `CancellationToken` plumbing.
+- `is_fatal_sqlx()` classification.
 - Tracing spans: `pgwq.poll_tick`, `.claim_batch`, `.handle_job`,
-  `.mark_*`. State transition events przez `emit_transition` helper
-  (single source, all sites).
+  `.mark_*`. State transition events.
 - Tests: `poll_interval_behavior.rs`, `concurrency_behavior.rs`,
-  `tracing_events_emitted.rs`, `sqlx_error_classification.rs`,
-  `fatal_sqlx_triggers_shutdown.rs`, `schema_missing_fails_loud.rs`,
-  `shutdown_drains_claimed_batch.rs` (W9).
+  `tracing_events_emitted.rs`.
 
-### Faza 5 — reaper (single-CTE, SKIP LOCKED, catch_unwind)
+### Faza 5 — reaper (single-CTE, SKIP LOCKED)
 
 - Reaper task spawn'ed parallel z poll loop.
-- Single-CTE z `queue = $1` filter + `CASE WHEN attempts >= max_attempts`.
-- `tracing::warn!` na reaped count, per-row `pgwq.state.transition`
-  events z `source="reaper"`, `tracing::error!` na dead-letter.
-- `AssertUnwindSafe(...).catch_unwind()` per tick, escalate po K=3
-  consecutive panics → worker shutdown.
+- Single-CTE z CASE WHEN attempts >= max_attempts.
+- `tracing::warn!` na reaped count, `tracing::error!` na dead-letter.
+- Reaper task wrapped w panic-recovery (`JoinSet` + on-panic restart? TBD).
 - Tests: `stale_running_reaped.rs`, `reaper_to_dead_when_max_attempts.rs`,
   `reaper_single_cte_no_race.rs`, `reaper_no_advisory_lock_leak.rs`,
-  `reaper_per_queue_isolation.rs` (regression dla W4),
-  `reaper_recovers_from_tick_panic.rs` (W10),
   `lease_timeout_behavior.rs`, `reaper_interval_behavior.rs`,
-  `dead_letter_logged.rs`, `reaper_transition_events.rs` (W7),
-  `at_least_once_semantics.rs`, `idempotency_key_stable_across_retries.rs`.
+  `dead_letter_logged.rs`.
 
 ### Faza 6 — retry semantics + BackoffPolicy + panic policy
 
@@ -1473,42 +1278,23 @@ Szczegóły migracji rust_event_outbox z apalis na pg_work_queue
 ## Open questions / decisions TBD
 
 1. **MSRV**: 1.85+ (edition 2024). Settled.
-2. **Multi-tenant via `queue` column** — single table. Settled.
+2. **Multi-tenant via `queue` column** — single table na start. Settled.
 3. **Plugin/tower middleware** — NIE. Settled.
 4. **Worker registration table** — NIE. Settled.
 5. **Push-side idempotency column** (`unique_key TEXT UNIQUE`) — NIE w v0.1.
 6. **Multi-queue worker** — one-queue-per-worker w v0.1. `Worker::queues(&[...])`
-   follow-up.
-7. **PgBouncer compat** — verify w CI matrix.
+   to follow-up.
+7. **PgBouncer compat** — verify w CI matrix (no LISTEN/NOTIFY, no
+   session advisory locks → powinno działać; testcontainers `pgbouncer`
+   image w dedicated test).
 8. **License** — MIT. Settled.
 9. **PgQ/Kraken-style two-table** — far future, not v0.1.
-10. **Lease renewal API (`JobContext::renew_lease`)** — DEFERRED to v0.2.
-    v0.1 stand-in: hard floor `MIN_LEASE_TIMEOUT=1s` + `tracing::warn!`
-    w builderze gdy `lease_timeout < 10s` + loud rustdoc warning ("set
-    lease_timeout ≥ p99 handler duration × 3").
-11. **Reaper task panic recovery** — SETTLED: catch_unwind per tick,
-    log + counter, escalate do worker shutdown po K=3 consecutive
-    panic ticks. Test `tests/reaper_recovers_from_tick_panic.rs`.
+10. **`reaper_interval` validation cross-knob** — `<= lease_timeout/2`.
+    Hard validation in builder.
+11. **Reaper task panic recovery** — TBD: monitor + restart vs
+    log + dead worker? Phase 5 decision.
 12. **Tracing-subscriber default**: nie installuje subscribera by
-    default (library best practice).
-13. **PG version check** — DO-block w migracji rejecting `< PG18`
-    (S5 z review):
-    ```sql
-    DO $$
-    BEGIN
-        IF current_setting('server_version_num')::int < 180000 THEN
-            RAISE EXCEPTION 'pgwq requires PostgreSQL 18+ (uuidv7() native), got %', current_setting('server_version');
-        END IF;
-    END$$;
-    ```
-14. **Fast-fail schema check** (S7 z review) — `Worker::start()` jako
-    first action runs `SELECT 1 FROM pgwq.jobs LIMIT 0` żeby loud-fail
-    przy brakującej migracji. Error → `BuildError::SchemaMissing { details }`.
-15. **last_error history** — overwritten każdy retry (single source). Pełna
-    historia wymaga centralized log retention keyed on `public_id`.
-    `pgwq.job_attempts` table jako v0.2 roadmap (S23).
-16. **`queue_stats(pool) -> QueueStats`** — v0.1 helper read-only function
-    dla operator cookbook (zwraca queued/running/done/dead counts).
+    default (library best practice — to user's app's responsibility).
 
 ## Anti-patterns z których wyciągnęliśmy lekcje
 
@@ -1533,10 +1319,8 @@ Hard rules:
    driver `.unwrap()` panics.)
 10. **All user-facing strings truncated at library boundary** zanim
     wrzucą do DB lub logu. Plus DB CHECK jako backstop.
-11. **Background tasks: catch_unwind per tick + threshold escalation.**
-    Reaper tick panic — isolated via `AssertUnwindSafe + catch_unwind`,
-    log + counter. Po K=3 consecutive panic ticks → worker shutdown
-    (loud failure, surfaced przez `ShutdownError::Fatal`). Faza 5.
+11. **Background tasks restart-aware lub explicit-shutdown.** Reaper
+    task panic = worker shutdown (faza 5 decyzja).
 
 ## Roadmap
 
