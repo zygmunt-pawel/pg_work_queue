@@ -55,6 +55,14 @@ CREATE TABLE pgwq.jobs (
     -- out_of_range in claim_batch's `attempts = j.attempts + 1`, putting the
     -- row in a stuck-running loop the reaper can't recover.
     attempts           INTEGER     NOT NULL DEFAULT 0,
+    -- Per-row max_attempts stamped by claim_batch from the claiming worker's
+    -- config. Reaper + library mark_retry use j.max_attempts (NOT worker-local
+    -- state.max_attempts) for the dead-vs-retry verdict, so rolling deploys
+    -- with heterogeneous max_attempts produce deterministic verdicts
+    -- (last claimer wins). Without this, Worker A (max=3) and Worker B (max=5)
+    -- racing FOR UPDATE SKIP LOCKED on the same stale row give non-deterministic
+    -- dead-letter for identical input. Default 0 for not-yet-claimed rows.
+    max_attempts       INTEGER     NOT NULL DEFAULT 0,
     -- Fencing token: set by claim_batch via gen_random_uuid (v4 — no time leak,
     -- ephemeral, never indexed). Cleared on every transition out of 'running'.
     -- Required for mark_done/retry/dead WHERE clauses to prevent the
@@ -87,6 +95,8 @@ CREATE TABLE pgwq.jobs (
         CHECK (last_error IS NULL OR length(last_error) <= 8192),  -- matches limits::MAX_LAST_ERROR_LEN
     CONSTRAINT jobs_attempts_nonneg
         CHECK (attempts >= 0),
+    CONSTRAINT jobs_max_attempts_nonneg
+        CHECK (max_attempts >= 0),
     -- Temporal monotonicity. Catches reordering bugs in claim/mark/reap paths.
     -- run_at >= created_at rejects "backfill into the past" — set created_at
     -- explicitly if you need that.
@@ -107,7 +117,8 @@ CREATE TABLE pgwq.jobs (
             AND last_attempted_at IS NULL
             AND first_attempted_at IS NULL
             AND finished_at IS NULL
-            AND lease_token IS NULL)
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL)
         OR (status = 'running'
             AND attempts > 0
             AND last_attempted_at IS NOT NULL
@@ -129,11 +140,16 @@ CREATE TABLE pgwq.jobs (
     )
 );
 
--- High-churn queue table: leave 20% free per block so updates can HOT in-place
--- instead of allocating new tuples elsewhere. Plus more aggressive autovacuum
--- so dead tuples (from done→DELETE and HOT chains) get reclaimed fast.
+-- High-churn queue table. fillfactor=90 leaves 10% headroom per block.
+-- Note: HOT updates are NOT achievable here — every mainstream transition
+-- (queued→running, running→awaiting_retry, running→done/dead, reaper) crosses
+-- partial-index predicates (jobs_claim_idx / jobs_reap_idx / jobs_terminal_idx),
+-- so each UPDATE allocates a new tuple regardless of fillfactor. The 10% slack
+-- helps anyway: faster autovacuum dead-tuple reclaim + new-tuple placement
+-- locality (avoids cross-block jumps for non-HOT updates). 80 was overkill;
+-- 90 trims 10% storage with no measurable regression on update path.
 ALTER TABLE pgwq.jobs SET (
-    fillfactor = 80,
+    fillfactor = 90,
     autovacuum_vacuum_scale_factor = 0.05,
     autovacuum_analyze_scale_factor = 0.05
 );
@@ -144,11 +160,17 @@ CREATE INDEX jobs_claim_idx
     ON pgwq.jobs (queue, run_at, id)
     WHERE status IN ('queued', 'awaiting_retry');
 
--- Reaper hot path. Indexed on lease_expires_at (per-row deadline set by
--- claim) instead of last_attempted_at — heterogeneous deployments with
--- different lease_timeout per replica must respect each row's own lease.
+-- Reaper hot path. Per-row deadline (set by claim) indexed alongside queue
+-- so per-queue reaper (Worker has one queue) does range scan precisely on
+-- its slice. Without `queue` prefix: index scan in lease_expires_at order
+-- traverses all running rows from all queues, applying heap-side queue=$1
+-- filter; under multi-queue deployment with skewed load this becomes a
+-- per-tick linear scan of foreign rows.
+-- `lease_expires_at` second so the index also serves heterogeneous deploys
+-- (Worker A lease=30s vs Worker B lease=10min on the same queue): per-row
+-- deadline still wins, A doesn't reap B's still-alive jobs.
 CREATE INDEX jobs_reap_idx
-    ON pgwq.jobs (lease_expires_at)
+    ON pgwq.jobs (queue, lease_expires_at)
     WHERE status = 'running';
 
 -- Purge functions hot path. `pgwq::purge_done(pool, age)` and

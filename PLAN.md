@@ -1,11 +1,10 @@
-# pg_work_queue — plan i przemyślenia (v2, post-multi-agent-review)
+# pg_work_queue — plan i przemyślenia
 
 > Status: design draft, pre-implementation. Konwencja po polsku
 > (kod/identyfikatory po angielsku) — zgodnie z `rust_event_outbox`.
-> Wersja v2: zaktualizowana po **9-agentowym review** (failure-rollback,
-> race-conditions, reinventing-wheels, verbose-design, resource-exhaustion,
-> audit-trail, error-handling, security, duplication) + Opus 4.7 review.
-> Backup wersji: PLAN_v0_original.md, PLAN_v1_pre_review.md.
+> Plan przeszedł 5 rund review (multi-agent + Opus + iteracyjne
+> correctness reviews). Pełna ewolucja w git history; ten plik to
+> single source of truth dla implementacji.
 
 ## Co to jest
 
@@ -116,34 +115,73 @@ fixnięte, (c) napisać własne. Wybieramy (c).
 ## Delivery semantics & idempotency
 
 **`pg_work_queue` daje at-least-once delivery.** Handler **MOŻE** być
-zawołany ≥1 raz dla tego samego logicznego jobu. Konkretnie:
+zawołany ≥1 raz dla tego samego logicznego jobu.
 
-- Handler kończy się sukcesem, `mark_done` query traci connection
-  zanim commit się zarejestruje → reaper flipuje, kolejny worker
-  re-execute.
-- Reaper flipuje row do `awaiting_retry` przez `lease_timeout` (worker
-  cię handler trwa dłużej niż lease) → stary handler kończy się i
-  jego `mark_done` 0-rows-affected (fencing token mismatch), ale
-  side-effect już się wykonał. Reaper-spawned retry wykonuje go ponownie.
-- Worker proces crashuje po handler success ale przed `mark_done`
-  commit → reaper recovery, nowy worker retry.
-- **Pułapka:** udany handler z `mark_done` fenced-out po `lease_timeout`
-  → row flipnięty do `awaiting_retry` z `attempts` już inkrementowanym
-  → kolejny worker re-execute → jeśli `attempts >= max_attempts` przy
-  drugiej próbie skończy `dead` mimo że **pierwszy run się powiódł
-  externally**. Dead-letter `tracing::error!` w tym przypadku jest mylący
-  (job wykonany, ale system tego nie zarejestrował). Mitigacja: ustaw
-  `lease_timeout >> p99 handler duration` żeby fenced-out był rzadkością.
-  Statystyka `Stats::fenced_out` policzy te zdarzenia.
+**Cancellation model — dwa poziomy:**
+
+1. **`handler_timeout`** (per-handler wall clock; default `lease_timeout × 80%`):
+   library wraps każdą inwokację handler'a w `tokio::time::timeout`. Po
+   elapsed handler future jest dropped (Drop runs, transactions roll back),
+   library wywołuje `mark_retry` z `reason = "handler_timeout"`; backoff
+   policy applies normalnie; jeśli `attempts ≥ max_attempts` → upgrade do
+   `mark_dead`. To jest **primary path** dla zawieszeń handler'a (slow API,
+   deadlock w user code, niekończący się retry-loop). Bez tego library nie
+   ma sposobu odzyskać slot concurrency'i (handler future stojący na await
+   blokuje permit w nieskończoność).
+2. **`lease_timeout`** (per-row deadline w DB; default 5min):
+   reaper threshold dla **process-death recovery** — worker process zginął
+   (crash, OOM, kernel kill, partycja sieciowa worker↔DB), nigdy nie
+   wywoła mark_*. Reaper flipuje status → kolejny worker re-claims
+   immediately (bez backoff'u, bo to infrastruktura, nie content jobu). To
+   jest **rzadka ścieżka**, nie hot-path; reaper SQL świadomie nie aktualizuje
+   `run_at` na ścieżce `awaiting_retry`, bo immediate retry jest pożądane.
+
+W obu przypadkach `attempts` jest już inkrementowane (przez `claim_batch`
+zanim handler ruszy).
+
+**Konkretne at-least-once scenarios:**
+
+- Handler timeout: future dropped na `.await` point. Side-effects
+  already-issued (HTTP POST wysłany przed cancellation, external API
+  charge committed serverside przed naszym network-cut) **survive**.
+  Mitigacja: `ctx.idempotency_key` jako Idempotency-Key dla external APIs.
+- Handler success, `mark_done` connection lost przed commit → row stays
+  `running` z lease_token → reaper after `lease_timeout` flips do
+  `awaiting_retry` → kolejny worker re-execute. Side-effect powtarza się.
+- Worker process crashuje po handler success ale przed `mark_done`
+  commit → reaper recovery jak wyżej.
+- **Pułapka:** udany handler którego `mark_done` zostało fenced-out
+  (rare: process pauza > `lease_timeout − handler_timeout`, default
+  margin ~1min przy default'ach) → row flipnięty do `awaiting_retry` z
+  `attempts` już inkrementowanym → kolejny worker re-execute → jeśli
+  `attempts >= max_attempts` skończy `dead` mimo że **pierwszy run się
+  powiódł externally**. Dead-letter `tracing::error!` jest wtedy mylący.
+  `Stats::fenced_out` policzy te zdarzenia.
+
+**Cancellation gotcha (CPU-bound work):** `tokio::time::timeout` cancel'i
+handler **tylko przy `.await` point**. Handler CPU-bound bez yield'ów
+(gorące computation, blokujące I/O bez `spawn_blocking`) **nie zostanie
+cancelled** — blokuje worker thread aż do completion; w międzyczasie lease
+może expire'ować i reaper przejmie row. Użyj `tokio::task::spawn_blocking`
+albo periodic `tokio::task::yield_now().await` dla CPU-bound work. Library
+nie ma sposobu enforce'ować tego z zewnątrz.
 
 **Semantyka `attempts`:** counter inkrementowany w `claim_batch`, czyli
-liczy **rozpoczęte attempts**, nie completed. Fence-out (handler success
-ale mark_done lost lease) **zlicza się jako attempt** — semantycznie:
-"job został odpalony N razy". Jeśli chcesz że `max_attempts=N` znaczy
-"N real retry chances after first try", ustaw `max_attempts ≥
-ceil(N × (1 + expected_fence_out_rate))`. Default `max_attempts=3` +
-prawidłowo skalibrowany `lease_timeout` (fence_out_rate ≈ 0) daje
-3 real chances.
+liczy **rozpoczęte attempts**, nie completed. Timeout, panic, fence-out,
+reaper recovery — wszystkie zliczają się jako attempt. Jeśli chcesz że
+`max_attempts=N` znaczy "N real retry chances after first try", ustaw
+`max_attempts ≥ ceil(N × (1 + expected_anomaly_rate))`. Default
+`max_attempts=3` + prawidłowo skalibrowane `handler_timeout`/`lease_timeout`
+(anomaly rate ≈ 0) daje 3 real chances.
+
+**Semantyka `last_error`:** ustawiane na NULL przez `claim_batch` (start
+attempta, brak stale data z poprzedniej próby), overwritten przez
+`mark_retry`/`mark_dead` (handler-side reason) lub `reaper` (lease_expired/
+lease_expired_max_attempts). **Bez COALESCE w reaperze** — `last_error`
+zawsze odzwierciedla **most recent transition reason**, nigdy stary error.
+To jest **canonical signal dla dead-letter**: gdy `tracing::error!` w
+emit_transition wyraża dead-letter event, `last_error` w DB matches reason
+attribute eventu. Operator widzi spójny obraz "why did this die".
 
 ### Handler-side idempotency contract
 
@@ -202,6 +240,8 @@ async fn main() -> anyhow::Result<()> {
         .concurrency(16)
         .max_attempts(5)
         .lease_timeout(Duration::from_secs(300))
+        .handler_timeout(Duration::from_secs(240))  // 80% of lease; mark_retry has 60s margin
+        .mark_timeout(Duration::from_secs(59))       // < 60s margin; library aborts mark_* before lease expiry
         .reaper_interval(Duration::from_secs(60))
         .retry_backoff(BackoffPolicy::exponential(
             Duration::from_secs(1),     // base
@@ -284,10 +324,12 @@ stripe.charge(amount, &ctx.idempotency_key.to_string()).await?;
 |---|---|---|---|
 | `queue(&str)` | required | non-empty, ≤ 64 chars | nazwa queue |
 | `poll_interval(Duration)` | 1s | ≥ 10 ms | deterministyczny cycle |
-| `concurrency(usize)` | num_cpus | 1..=(pool.size - 3) | max parallel handlers; **+3 reserved** for poll/reaper/mark queries |
+| `concurrency(usize)` | num_cpus | 1..=`floor((pool.options().get_max_connections() - 2) / 2)` | max parallel handlers; **pool budget: `max_connections >= concurrency × 2 + 2`** (każdy handler może trzymać 1 conn podczas pracy + 1 dla mark_*; +2 dla poll/reaper). **MUSI używać `pool.options().get_max_connections()`, NIE `pool.size()`** (size jest lazy, =0 dla świeżego pool'a — fresh pool always-fail bug). |
+| `mark_timeout(Duration)` | `lease_timeout − handler_timeout − 1s` (margin pre-lease-expiry) | ≥ 100ms, ≤ lease_timeout − handler_timeout | timeout dla `mark_done`/`mark_retry`/`mark_dead` SQL wrapped w `tokio::time::timeout`. Pod pool starvation mark_* może czekać na connection sekundy → lease wygasa zanim mark commit'uje → fence-out + duplicate side-effects. Timeout fire → `Stats::mark_timed_out++`, leave row `running`, reaper przejmie (Anti-pattern #14). |
 | `max_attempts(u32)` | 3 | ≥ 1, ≤ `i32::MAX` | przed dead-letter |
-| `lease_timeout(Duration)` | 5min | ≥ 1s, ≥ poll_interval × 5 | stale-running threshold; **set ≥ p99 handler duration × 3** (warn! issued if < 10s) |
-| `reaper_interval(Duration)` | lease_timeout/4 | ≥ 1s, ≤ lease_timeout/2 | reaper tick cadence |
+| `lease_timeout(Duration)` | 5min | ≥ 1s, ≥ poll_interval × 5, ≥ handler_timeout + 1s | **reaper threshold dla process-death recovery** (crash/OOM/partycja worker↔DB); handler-level cancellation idzie przez `handler_timeout`, nie przez ten knob. Domyślnie ratio: `handler_timeout = lease_timeout × 80%` |
+| `handler_timeout(Duration)` | `lease_timeout × 80%` (clamped ≥ `MIN_HANDLER_TIMEOUT`) | ≥ 1s (`MIN_HANDLER_TIMEOUT`), ≤ lease_timeout − 1s | per-handler wall clock; library wraps invokację w `tokio::time::timeout`. Elapsed → `mark_retry { reason: "handler_timeout" }` z normalnym backoff'em policy; if `attempts ≥ max_attempts` → upgrade do `mark_dead`. **Gotcha:** cancel'i handler tylko przy `.await` point — CPU-bound work musi iść przez `spawn_blocking` |
+| `reaper_interval(Duration)` | lease_timeout/4 | ≥ 1s, ≤ lease_timeout/2 | reaper tick cadence (tylko process-death recovery; rare path) |
 | `batch_size(usize)` | 10 | 1..=1_000 | rows per claim_batch |
 | `retry_backoff(BackoffPolicy)` | `Exponential { 1s, 2.0, 5min, 0.2 }` | jitter ∈ [0,1], cap ≤ 24h | used when `JobError::Retry { retry_in: None, .. }` |
 | `panic_policy(PanicPolicy)` | `Retry` | enum: `Retry` \| `Dead` | what to do when handler panics |
@@ -316,10 +358,21 @@ pub mod limits {
     /// Minimum poll_interval allowed in builder.
     pub const MIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-    /// Reaper sweep batch size (rows per tick). 256 vs 1000 — 1000 może
-    /// hit `max_locks_per_transaction` (default 64) na heavy concurrent reapers
-    /// (N1 z review). 256 safe.
-    pub const REAPER_BATCH_SIZE: usize = 256;
+    /// Minimum handler_timeout. Below this the handler cannot reliably finish
+    /// trivial work (parse + 1 DB query) and `mark_retry` commit before being
+    /// aborted. Lower bound for builder validation.
+    pub const MIN_HANDLER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// Reaper sweep batch size (rows per tick). Wcześniej 256 z mylącym
+    /// uzasadnieniem o `max_locks_per_transaction` — TO BYŁA NIEPRAWDA:
+    /// `max_locks_per_transaction` (default 64) limituje lock manager entries
+    /// dla relation/object/advisory locks, NIE row locks (heap tuple xmax,
+    /// które FOR UPDATE SKIP LOCKED tu używa). 1024 OK pod normal i disaster
+    /// recovery. Pod data-center power cycle z 1M rows w `running`, single
+    /// reaper drainuje ~13 rows/sec przy reaper_interval=75s — 21h recovery.
+    /// Z N replikami + adaptive ticking (poll loop nie czeka na tick gdy
+    /// reaped == LIMIT) — minutes do hours zamiast days.
+    pub const REAPER_BATCH_SIZE: usize = 1024;
 
     /// Aggregate cap na całkowity batch payload bytes — chroni przed
     /// 10k items × 1 MiB = 10 GB single transaction (S3 z review).
@@ -365,7 +418,9 @@ CREATE TABLE pgwq.jobs (
     payload            BYTEA       NOT NULL,
     status             pgwq.job_status NOT NULL DEFAULT 'queued',
     attempts           INTEGER     NOT NULL DEFAULT 0,
+    max_attempts       INTEGER     NOT NULL DEFAULT 0,  -- per-row, stamped by claim_batch (rolling-deploy safe)
     lease_token        UUID,
+    lease_expires_at   TIMESTAMPTZ,             -- set by claim_batch (now()+lease_timeout); reaper compares per-row
     last_error         TEXT,
     last_attempted_at  TIMESTAMPTZ,
     first_attempted_at TIMESTAMPTZ,
@@ -379,6 +434,7 @@ CREATE TABLE pgwq.jobs (
     CONSTRAINT jobs_payload_max_size      CHECK (octet_length(payload) <= 1048576),
     CONSTRAINT jobs_last_error_max_len    CHECK (last_error IS NULL OR length(last_error) <= 8192),
     CONSTRAINT jobs_attempts_nonneg       CHECK (attempts >= 0),
+    CONSTRAINT jobs_max_attempts_nonneg   CHECK (max_attempts >= 0),
     CONSTRAINT jobs_temporal CHECK (
         (first_attempted_at IS NULL OR first_attempted_at >= created_at)
         AND (last_attempted_at IS NULL OR last_attempted_at >= COALESCE(first_attempted_at, created_at))
@@ -415,11 +471,15 @@ CREATE TABLE pgwq.jobs (
     )
 );
 
--- High-churn queue tables bloatują na default settings. fillfactor=80
--- zostawia 20% wolnego per block → HOT updates in-place; agresywniejszy
--- autovacuum → dead tuples reclamowane szybciej.
+-- fillfactor=90: **HOT updates są NIEosiągalne** w tym schemacie — każda
+-- mainstream tranzycja (queued→running, running→awaiting_retry, →done/dead,
+-- reaper) crossuje partial-index predicate (jobs_claim_idx / jobs_reap_idx /
+-- jobs_terminal_idx), więc każdy UPDATE alokuje nowy tuple niezależnie od
+-- fillfactor. 10% slack pomaga jednak na non-HOT path: szybszy autovacuum
+-- dead-tuple reclaim + locality nowych tuples (mniej cross-block jumps).
+-- 80 było overkill (poprzedni komentarz mylił "HOT in-place" — nieprawda).
 ALTER TABLE pgwq.jobs SET (
-    fillfactor = 80,
+    fillfactor = 90,
     autovacuum_vacuum_scale_factor = 0.05,
     autovacuum_analyze_scale_factor = 0.05
 );
@@ -430,12 +490,16 @@ CREATE INDEX jobs_claim_idx
     WHERE status IN ('queued', 'awaiting_retry');
 
 -- Reaper hot path
--- Per-row deadline (set by claim using THIS worker's lease_timeout).
--- Reaper compares now() > lease_expires_at; bez tego heterogeneous deploy
--- (Worker A lease=30s, Worker B lease=10min, ten sam queue) by powodował
--- że A reapuje B-running joby.
+-- (queue, lease_expires_at) — leading `queue` daje per-queue range scan
+-- precyzyjnie na slice tej kolejki. Bez prefixu: scan w order
+-- lease_expires_at iteruje przez running rows wszystkich queue, heap-side
+-- filter queue=$1, LIMIT stosowane po filtrze → przy 10 queue'kach i
+-- jednej z dużym crash backlog'iem, reaper innej queue robi w każdym
+-- ticku linear scan cudzych rows. lease_expires_at jako secondary
+-- zachowuje per-row deadline dla heterogeneous deploy (Worker A lease=30s
+-- vs Worker B lease=10min na tej samej queue → A nie reapuje B-running).
 CREATE INDEX jobs_reap_idx
-    ON pgwq.jobs (lease_expires_at)
+    ON pgwq.jobs (queue, lease_expires_at)
     WHERE status = 'running';
 
 -- Purge functions hot path
@@ -508,6 +572,13 @@ ręcznie ze swojego cron / scheduler.
 
 ### Poll loop (heart)
 
+**Architectural rule: acquire permits FIRST, then claim only what permits
+allow.** Bez tego batch_size > free_permits powoduje że ostatnie claim'ed
+rows siedzą `running` z attempts++ i `lease_expires_at` tykającym, czekając
+na permit — pod heterogenicznymi czasami handlerów (jeden 400s, reszta 100s)
+reaper przejmuje row zanim handler ruszy → mass fence-out, side-effects
+duplikują się przez retry-on-other-worker (Anti-pattern #13).
+
 ```rust
 async fn poll_loop<T>(state: Arc<WorkerState<T>>) {
     let mut ticker = tokio::time::interval(state.poll_interval);
@@ -518,53 +589,96 @@ async fn poll_loop<T>(state: Arc<WorkerState<T>>) {
             _ = state.shutdown.cancelled() => break,
         }
 
-        let permit = tokio::select! {
+        // Gate na capacity: blokujący acquire pierwszego permitu (z shutdown
+        // shortcut). To ZANIM ruszymy claim_batch — w ten sposób mamy gwarancję
+        // że co najmniej 1 row claim'ed będzie miał permit od razu, a lease
+        // zacznie tykać dopiero kiedy handler faktycznie biegnie.
+        let p1 = tokio::select! {
             r = state.semaphore.clone().acquire_owned() => r,
             _ = state.shutdown.cancelled() => break,
         };
-        let Ok(permit) = permit else { break };
+        let Ok(p1) = p1 else { break };  // semaphore closed → handle dropped
+        let mut permits = vec![p1];
 
+        // Greedy try_acquire reszty do batch_size — bez blokowania.
+        // Pod heavy load (wszystkie inne permity zajęte) zostaniemy z 1 permit,
+        // claim_batch zwróci ≤ 1 row, ale każdy claimed row ma permit immediately.
+        // Pod idle/uniform load — permits.len() ≈ batch_size, efficient.
+        while permits.len() < state.batch_size {
+            match state.semaphore.clone().try_acquire_owned() {
+                Ok(p) => permits.push(p),
+                Err(tokio::sync::TryAcquireError::NoPermits) => break,
+                Err(tokio::sync::TryAcquireError::Closed) => return,
+            }
+        }
+
+        let want = permits.len();
         let span = tracing::info_span!("pgwq.poll_tick",
-            queue = %state.queue, batch_size = state.batch_size);
+            queue = %state.queue, permits = want, batch_size_max = state.batch_size);
         let _enter = span.enter();
 
-        match claim_batch(&state.pool, &state.queue, state.batch_size).await {
-            Ok(rows) if rows.is_empty() => { drop(permit); continue; }
+        // CRITICAL: claim_batch SQL AWAIT musi być wrapowany w shutdown select.
+        // Bez tego pod pool starvation (sqlx acquire_timeout default 30s)
+        // shutdown cancel czeka cały acquire_timeout zanim się zauważy — łamie
+        // dokumentowany "shutdown exits immediately" kontrakt. Drop future =
+        // sqlx server-side cancel, connection released.
+        let claim_result = tokio::select! {
+            r = claim_batch(&state.pool, &state.queue, want, state.max_attempts) => r,
+            _ = state.shutdown.cancelled() => break,
+        };
+
+        match claim_result {
+            Ok(rows) if rows.is_empty() => {
+                // Nothing to do; permits drop automatycznie → other workers/przyszłe
+                // ticki dostaną zwrócone permity.
+                continue;
+            }
             Ok(rows) => {
-                tracing::info!(claimed = rows.len(), "batch claimed");
-                // CRITICAL: rows są już `running` w DB z attempts++.
-                // Shutdown podczas spawn loop = abandoned rows do reaper
-                // recovery. Aby tego uniknąć — spawn loop **bez tokio::select
-                // na shutdown**. Bierzemy permity nawet po cancel.
-                // Stratny w time-to-drain (każdy row dostanie handler), ale
-                // semantically correct (każdy claimed row → handler called).
-                let mut iter = rows.into_iter();
-                if let Some(row) = iter.next() {
+                tracing::info!(claimed = rows.len(), wanted = want, "batch claimed");
+                // CRITICAL invariant: rows.len() ≤ permits.len() (claim respects LIMIT).
+                // Każdy row dostaje permit immediately — spawn nie czeka na semaphore.
+                // Nadmiarowe permity (jeśli claim zwrócił mniej niż want) dropped
+                // automatycznie poniżej.
+                for (row, permit) in rows.into_iter().zip(permits.drain(..)) {
                     state.tasks.spawn(handle_job(row, state.clone(), permit));
                 }
-                for row in iter {
-                    // Block aż permit dostępny (no shutdown shortcut).
-                    let Ok(p) = state.semaphore.clone().acquire_owned().await
-                        else { break }; // semaphore closed (only when handle drop)
-                    state.tasks.spawn(handle_job(row, state.clone(), p));
-                }
-                // Sprawdź shutdown PO spawn'owaniu całego batch'a.
-                if state.shutdown.is_cancelled() { break; }
+                // Pozostałe permits w `permits` dropped tutaj — zwracają sloty.
             }
             Err(e) if is_fatal_sqlx(&e) => {
                 tracing::error!(error = %e, "fatal DB error in claim_batch; shutting down worker");
-                state.last_fatal.lock().get_or_insert_with(|| Arc::new(e));
+                let _ = state.last_fatal.set(Arc::new(e));
                 state.shutdown.cancel();
                 break;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "claim batch failed; will retry next tick");
-                drop(permit);
+                // permits dropped (drain at end of scope) → other workers dostaną
+                // sloty z powrotem.
             }
         }
     }
 }
 ```
+
+**Dlaczego to jest poprawne:**
+
+1. **Brak claim-without-permit window.** Permity są secured PRZED claim'em.
+   Każdy claimed row ma gwarantowany dostępny permit → handle_job spawn
+   immediately, lease zaczyna tykać dopiero w handlerze, nie w queue.
+2. **Brak shutdown race** w spawn loop. `permits.drain(..)` daje
+   `OwnedSemaphorePermit` które move'ujemy do handle_job — nie wołamy
+   `acquire_owned().await` w środku spawn loop, więc shutdown nie ma
+   gdzie nas przerwać między claim'em a spawn'em.
+3. **Heterogeniczne czasy handlerów** (mix 100s+400s) — pod load'em
+   try_acquire zwraca NoPermits szybko, permits.len() jest małe (np. 1),
+   claim'amy tylko tyle ile możemy obsłużyć teraz. Nie zalegamy
+   claim'ed-ale-niespawn'owanymi rows.
+4. **Pod idle load** — wszystkie permity wolne → permits.len() = batch_size,
+   claim'amy maksymalny batch, efficient SQL roundtrip.
+
+**Trade-off:** więcej claim queries pod heavy contention (np. 1 row per
+claim zamiast 10). Akceptowalne — claim_batch jest cheap (1 partial index
+scan + UPDATE FROM CTE).
 
 `is_fatal_sqlx` distinguishes `PoolClosed` / `WorkerCrashed` / `Migrate`
 (fatal → self-shutdown) od `Database` / `Io` / `Tls` (transient → retry
@@ -585,13 +699,21 @@ WITH claimed AS (
 UPDATE pgwq.jobs j
 SET status = 'running',
     attempts = j.attempts + 1,
+    max_attempts = $4,                        -- $4 = THIS worker's max_attempts,
+                                              -- stamped per-row → rolling-deploy
+                                              -- safe (reaper i mark_retry używają
+                                              -- j.max_attempts, nie worker-local).
     last_attempted_at = now(),
     first_attempted_at = COALESCE(j.first_attempted_at, now()),
     lease_token = gen_random_uuid(),
-    lease_expires_at = now() + $3::interval  -- $3 = THIS worker's lease_timeout
+    lease_expires_at = now() + $3::interval,  -- $3 = THIS worker's lease_timeout
+    last_error = NULL                         -- start fresh: poprzedni attempt's
+                                              -- error nie zostaje widoczny podczas
+                                              -- aktualnego `running` window'a;
+                                              -- mark_retry/dead/reaper i tak overwritują
 FROM claimed
 WHERE j.id = claimed.id
-RETURNING j.id, j.public_id, j.queue, j.payload, j.attempts,
+RETURNING j.id, j.public_id, j.queue, j.payload, j.attempts, j.max_attempts,
           j.first_attempted_at, j.lease_token, j.lease_expires_at;
 ```
 
@@ -605,7 +727,7 @@ mieć dodatkowy guard). v2 łączy w jeden CTE z `CASE WHEN`:**
 
 ```sql
 WITH stale AS (
-    SELECT id, attempts FROM pgwq.jobs
+    SELECT id, attempts, max_attempts FROM pgwq.jobs
     WHERE queue = $1                          -- per-queue isolation
       AND status = 'running'
       AND lease_expires_at < now()            -- per-row deadline (set at claim)
@@ -615,17 +737,26 @@ WITH stale AS (
 )
 UPDATE pgwq.jobs j
 SET status = CASE
-        WHEN s.attempts >= $3 THEN 'dead'::pgwq.job_status
+        -- s.max_attempts jest per-row (stamped przez claim_batch) — rolling-deploy
+        -- safe: Worker A (max=3) i Worker B (max=5) widzą TĘ SAMĄ wartość z DB,
+        -- werdykt deterministyczny niezależnie od which-replica-wins-the-lock.
+        WHEN s.attempts >= s.max_attempts THEN 'dead'::pgwq.job_status
         ELSE 'awaiting_retry'::pgwq.job_status
     END,
     finished_at = CASE
-        WHEN s.attempts >= $3 THEN now()
+        WHEN s.attempts >= s.max_attempts THEN now()
         ELSE NULL
     END,
-    last_error = COALESCE(j.last_error, CASE
-        WHEN s.attempts >= $3 THEN 'lease_expired_max_attempts'
+    last_error = CASE
+        -- Overwrite, NIE COALESCE — reaper jest najnowszym signalem o powodzie
+        -- transition'a. Stare last_error (z poprzedniego mark_retry zanim claim
+        -- wyzerował) byłby mylący w dead-letter `tracing::error!`: operator
+        -- widzi 'stripe_declined' z attempta 1 zamiast 'lease_expired' (worker
+        -- crash w attempt 2). claim_batch ustawia last_error=NULL na start
+        -- attempta, ale defense-in-depth: tu zawsze overwrite.
+        WHEN s.attempts >= s.max_attempts THEN 'lease_expired_max_attempts'
         ELSE 'lease_expired'
-    END),
+    END,
     lease_token = NULL,
     lease_expires_at = NULL
 FROM stale s
@@ -646,26 +777,47 @@ Reaper task:
 ```rust
 async fn reaper_loop(state: Arc<WorkerState>) {
     let mut ticker = tokio::time::interval(state.reaper_interval);
+    let mut skip_next_tick = false;  // adaptive: drain backlog without waiting
     loop {
-        tokio::select! {
-            _ = ticker.tick() => {},
-            _ = state.shutdown.cancelled() => return,
+        if !skip_next_tick {
+            tokio::select! {
+                _ = ticker.tick() => {},
+                _ = state.shutdown.cancelled() => return,
+            }
         }
+        skip_next_tick = false;
 
         let span = tracing::info_span!("pgwq.reap_tick", queue = %state.queue);
         let _enter = span.enter();
 
-        match reap(&state.pool, &state.queue, state.lease_timeout,
-                   limits::REAPER_BATCH_SIZE, state.max_attempts).await
+        // reap() signature: (pool, queue, batch_limit) — max_attempts NOT passed,
+        // reaper SQL używa j.max_attempts per-row (rolling-deploy safe, #1).
+        // lease_timeout też NOT passed — per-row j.lease_expires_at już compare'owany SQL-side.
+        // CRITICAL: reap SQL await wrapowany w shutdown select (same reason
+        // jak claim_batch — pool starvation nie może blokować shutdown).
+        let reap_result = tokio::select! {
+            r = reap(&state.pool, &state.queue, limits::REAPER_BATCH_SIZE) => r,
+            _ = state.shutdown.cancelled() => return,
+        };
+        match reap_result
         {
             Ok(reaped) if reaped.is_empty() => {}
             Ok(reaped) => {
                 let dead_count = reaped.iter().filter(|r| r.status == "dead").count();
                 let retry_count = reaped.len() - dead_count;
+                // Adaptive: jeśli zwróciliśmy pełen LIMIT, sygnalizuje to backlog
+                // — następna iteracja skip'uje ticker.tick() i lecimy at-SQL-speed
+                // aż drain. Pod normal load reaped << LIMIT, normalna cadence
+                // zachowana. Pod disaster recovery (1M stale rows) — drain bez
+                // 75s pauz między batch'ami.
+                if reaped.len() >= limits::REAPER_BATCH_SIZE {
+                    skip_next_tick = true;
+                }
                 tracing::warn!(
                     reaped_total = reaped.len(),
                     reaped_dead = dead_count,
                     reaped_retry = retry_count,
+                    backlog_continues = skip_next_tick,
                     "stale jobs reaped"
                 );
                 // Per-row pgwq.state.transition events tak samo jak
@@ -756,12 +908,148 @@ fn extract_panic_message(je: tokio::task::JoinError) -> String {
 }
 ```
 
-Codec decode w worker (`handle_job`) używa tego samego patternu —
-`tokio::spawn(decode_fn)` then await → panic w codec → mark_dead z
-`reason = "codec panic: ..."`.
+Codec decode w worker (`handle_job`) używa innego patternu niż reaper:
+**sync** `std::panic::catch_unwind(AssertUnwindSafe(|| codec.decode(...)))`
+zamiast `tokio::spawn`. Powody:
+
+1. Codec decode jest synchroniczny i CPU-bound; `tokio::spawn` per claimed
+   row dorzuca scheduling overhead (10us × 10k claim/s = 100ms/s waste).
+2. Closure'a `|| codec.decode(payload)` nie capture'uje `&PgPool` ani innych
+   non-UnwindSafe refs (tylko bajty payloadu) — `AssertUnwindSafe` jest
+   poprawnie applied, bez problemów z reaper'em (linia 745-748).
+3. Codec decode jest **w środku handle_job**, który sam jest w JoinSet —
+   gdyby tu użyć `tokio::spawn`, leak per Anti-pattern #12 (outer abort_all
+   → JoinHandle dropped → decode task detached). Sync catch_unwind nie ma
+   tego problemu (no async cancellation point).
+
+Panic w codec → mark_dead z `reason = "codec panic: ..."`.
 
 Test: `tests/reaper_recovers_from_tick_panic.rs` (inject panic via test-only
 hook, assert worker survives ≤2 panics, dies on 3rd).
+
+### Handler invocation (`handle_job`)
+
+Każdy claim'ed row dostaje invokację handler'a wrapowaną w `tokio::time::timeout`
+i izolowaną przez **lokalny `JoinSet`** — nie przez `tokio::spawn`. Powód
+omówiony niżej.
+
+```rust
+async fn handle_job<T>(
+    row: Job<T>,
+    state: Arc<WorkerState<T>>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let ctx = JobContext { /* id, public_id, idempotency_key, ... */ };
+
+    // Panic isolation + proper cascade cancel: local JoinSet's Drop aborti
+    // pending tasks. Outer abort (state.tasks.abort_all()) → handle_job
+    // unwind → local `set` dropped → handler future poprawnie cancelled.
+    let mut set = tokio::task::JoinSet::new();
+    let handler_fut = (state.handler)(row.payload.clone(), ctx.clone());
+    set.spawn(tokio::time::timeout(state.handler_timeout, handler_fut));
+
+    let outcome = set.join_next().await;  // Option<Result<Result<HandlerResult, Elapsed>, JoinError>>
+
+    // Helper: każde mark_* SQL wrapowane w `mark_timeout`. Pool starvation +
+    // brak timeout'u = mark_* czeka sekundy, lease wygasa, reaper przejmuje,
+    // mark_* w końcu zwraca 0 rows (fenced), side-effect duplikuje się przez
+    // retry-on-other-worker. Z timeoutem: bounded wait, Stats::mark_timed_out++,
+    // leave row 'running', reaper przejmie cleanly (Anti-pattern #14).
+    let mark = |fut| async move {
+        match tokio::time::timeout(state.mark_timeout, fut).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                state.stats.mark_timed_out.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(job.id = ctx.id, mark_timeout_ms = ?state.mark_timeout,
+                    "mark_* timed out under pool pressure; leaving row 'running' for reaper recovery");
+            }
+        }
+    };
+
+    match outcome {
+        Some(Ok(Ok(Ok(())))) => {
+            mark(mark_done(&state.pool, ctx.id, ctx.lease_token)).await;
+        }
+        Some(Ok(Ok(Err(JobError::Retry { reason, retry_in })))) => {
+            mark(mark_retry_or_upgrade_dead(&state, &ctx,
+                fmt_err_trimmed(&reason),
+                retry_in.unwrap_or_else(|| state.backoff.next(ctx.attempt)))).await;
+        }
+        Some(Ok(Ok(Err(JobError::Abort { reason })))) => {
+            mark(mark_dead(&state.pool, ctx.id, ctx.lease_token,
+                      fmt_err_trimmed(&reason))).await;
+        }
+        Some(Ok(Err(_elapsed))) => {
+            // handler_timeout fired. Inner future już dropped przez timeout
+            // wrapper; mark_retry leci jak Retry { reason: "handler_timeout" }.
+            state.stats.timed_out.fetch_add(1, Ordering::Relaxed);
+            mark(mark_retry_or_upgrade_dead(&state, &ctx,
+                "handler_timeout",
+                state.backoff.next(ctx.attempt))).await;
+        }
+        Some(Err(je)) if je.is_panic() => {
+            let msg = extract_panic_message(je);
+            match state.panic_policy {
+                PanicPolicy::Retry => mark(mark_retry_or_upgrade_dead(&state, &ctx,
+                    &format!("panic: {}", fmt_err_trimmed(&msg)),
+                    state.backoff.next(ctx.attempt))).await,
+                PanicPolicy::Dead => mark(mark_dead(&state.pool, ctx.id, ctx.lease_token,
+                    &format!("panic: {}", fmt_err_trimmed(&msg)))).await,
+            }
+        }
+        Some(Err(_cancelled)) => {
+            // Wewnętrzny task w `set` został abort'ed PRZED join_next() —
+            // ścieżka teoretyczna (nigdy nie wołamy set.abort_all() z wnętrza
+            // handle_job). Jeśli kiedyś się pojawi: leave row 'running',
+            // reaper recover'i po lease_expires_at.
+            unreachable!("inner task can only be cancelled via JoinSet::drop, which happens after handle_job returns")
+        }
+        None => unreachable!("set had exactly one task spawned"),
+    }
+    // _permit dropped here → semaphore slot freed.
+    // `set` dropped here — no-op if join_next() returned; aborti pending
+    // tasks jeśli handle_job sam jest cancelled (cascade).
+}
+```
+
+**Dlaczego lokalny `JoinSet`, nie `tokio::spawn`:**
+
+`tokio::spawn` zwraca `JoinHandle`, którego **`Drop` nie aborti** spawned
+tasku — tylko detach'uje go. Jeśli `handle_job` jest w głównym `JoinSet`
+worker'a i `abort_all()` zostanie wywołane (shutdown timeout, fatal SQL,
+panic escalation), to:
+
+1. `handle_job` task dostaje abort signal → unwind przy najbliższym `.await`.
+2. Lokalne zmienne dropped — w tym `joined: JoinHandle` (gdyby był).
+3. **`JoinHandle::drop` detach'uje, nie aborti** → wewnętrzny spawn żyje
+   dalej, kontynuuje handler aż do natural completion.
+4. mark_*** nigdy nie zostaje wywołany (kod po `joined.await` umarł razem
+   z handle_job).
+5. Side-effects handler'a wykonują się dalej; row stoi `running` do
+   `lease_expires_at`; reaper przejmuje.
+
+Z `JoinSet` zamiast `JoinHandle`: **`JoinSet::drop` aborti wszystkie
+pending tasks** (udokumentowane tokio invariant). Cascade działa
+poprawnie — outer abort handle_job → lokalny set dropped → inner handler
+task aborted → handler future dropped at next `.await`, Drop runs.
+
+**Trade-off vs `catch_unwind`:** plan świadomie nie używa
+`futures::catch_unwind` (linia 745-748: brak `futures-util` w deps +
+UnwindSafe issues dla `&PgPool` w reaperze). `JoinSet` daje to samo
+(`JoinError::is_panic()` jako panic surface) bez nowego deps i bez
+UnwindSafe bounds na user-controlled handler state.
+
+**Cancellation semantics handler'a:** kiedy `handler_timeout` elapsed,
+`tokio::time::timeout` zwraca `Err(Elapsed)` a inner future (handler)
+zostało dropped at `.await` point. Owned resources (sqlx connections,
+hyper HTTP w toku) zwolnione przez Drop. Side-effects już issued
+serverside (HTTP POST wysłany przed cancel'em) **survive** — patrz
+§ Delivery semantics dla `idempotency_key` contract.
+
+**Helper `mark_retry_or_upgrade_dead`:** central'izuje logikę
+"if attempts >= max_attempts → upgrade Retry path do mark_dead". Wszystkie
+3 call sites (JobError::Retry, handler_timeout, panic w PanicPolicy::Retry)
+używają tego samego helper'a żeby decyzja nie drift'owała.
 
 ### Mark queries (fencing token w WHERE)
 
@@ -847,11 +1135,13 @@ tracing::info!(status = %status, age = ?age, deleted = total, "purge complete");
 
 ```sql
 -- run_at omitted — DB DEFAULT now() fires per row.
+-- Bez RETURNING ani WITH ORDINALITY: Postgres docs explicit'ie nie gwarantują
+-- order RETURNING, a public_id i tak generujemy client-side PRZED INSERT'em.
+-- Zwracamy z Rust'a client-side Vec<Uuid> w input order, no DB roundtrip
+-- needed dla result set.
 INSERT INTO pgwq.jobs (queue, payload, public_id)
 SELECT $1, payload, public_id
-FROM unnest($2::bytea[], $3::uuid[]) WITH ORDINALITY AS u(payload, public_id, ord)
-ORDER BY ord
-RETURNING id, public_id;
+FROM unnest($2::bytea[], $3::uuid[]) AS u(payload, public_id);
 ```
 
 `Pusher` client-side:
@@ -864,8 +1154,46 @@ RETURNING id, public_id;
    `PushError::BatchPayloadTooLarge { total_bytes, max }`. Bez tego
    5 GB transient buffor zanim item 4999 fails.
 3. Generate `public_id = Uuid::now_v7()` per item (client-side dla
-   outbox correlation-in-same-tx; deterministic order).
-4. Single `INSERT...SELECT FROM unnest(...) WITH ORDINALITY` round-trip.
+   outbox correlation-in-same-tx; deterministic order, **canonical handle**
+   zwracany z Pusher'a).
+4. Single `INSERT...SELECT FROM unnest(...)` round-trip; **no RETURNING**.
+5. Verify `rows_affected == public_ids.len()`; mismatch (CHECK violation
+   on jeden item, etc.) → `PushError::BatchPartial { inserted, expected }`.
+   Pod normalnym INSERT'em wszystko-albo-nic (single statement) — mismatch
+   teoretycznie nieosiągalny bo CHECK fail rollback'uje całą statement.
+   Defense-in-depth dla future cases (np. ON CONFLICT DO NOTHING jeśli
+   kiedyś dodamy push-side dedup w v0.2).
+6. Return client-side `Vec<Uuid>` w input order — to są te same UUIDy
+   które wstawiliśmy do DB, w identycznej kolejności jak `payloads` input.
+
+```rust
+// Pusher::push_batch (sketch)
+async fn push_batch<T: Serialize>(
+    &self, tx: &mut PgConnection, payloads: &[T],
+) -> Result<Vec<Uuid>, PushError> {
+    // (validations + encode loop omitted)
+    let public_ids: Vec<Uuid> = payloads.iter().map(|_| Uuid::now_v7()).collect();
+    let payload_bytes: Vec<Vec<u8>> = /* encode each */;
+
+    let rows = sqlx::query!(
+        "INSERT INTO pgwq.jobs (queue, payload, public_id)
+         SELECT $1, payload, public_id
+         FROM unnest($2::bytea[], $3::uuid[]) AS u(payload, public_id)",
+        &self.queue, &payload_bytes, &public_ids,
+    )
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+
+    if rows as usize != public_ids.len() {
+        return Err(PushError::BatchPartial {
+            inserted: rows as usize,
+            expected: public_ids.len(),
+        });
+    }
+    Ok(public_ids)
+}
+```
 
 Return: `Vec<Uuid>` w **input order**. Drugi wariant
 `push_batch_at(tx, &[(T, Option<DateTime<Utc>>)])` jako follow-up
@@ -962,7 +1290,32 @@ pub enum BackoffPolicy {
 impl BackoffPolicy {
     pub fn exponential(base: Duration, factor: f64, cap: Duration, jitter: f64) -> Self;
     pub fn fixed(d: Duration) -> Self;   // → Linear { base: d, inc: 0, cap: d }
-    pub fn next(&self, attempt: u32) -> Duration;
+    pub fn next(&self, attempt: u32) -> Duration {
+        let raw_secs = match self {
+            BackoffPolicy::Linear { base, increment, cap } => {
+                base.as_secs_f64() + increment.as_secs_f64() * attempt as f64
+            }
+            BackoffPolicy::Exponential { base, factor, cap, .. } => {
+                // factor.powi(attempt as i32) może overflow'ować do INFINITY
+                // przy dużych attempt + factor>2 (np. factor=10, attempt=400).
+                // Duration::from_secs_f64(INFINITY) PANICUJE — clamp przed
+                // konwersją. `panic = "deny"` w Cargo.toml dotyczy explicit
+                // panic! macro, NIE runtime stdlib panics.
+                base.as_secs_f64() * factor.powi(attempt as i32)
+            }
+        };
+        let cap_secs = self.cap().as_secs_f64();
+        // Clamp na non-finite (NaN/INF) + cap. Plus saturating max(0.0).
+        let clamped_secs = if raw_secs.is_finite() {
+            raw_secs.min(cap_secs).max(0.0)
+        } else {
+            cap_secs
+        };
+        // Jitter zastosowany do clamped value (jitter też może rozszerzyć
+        // poza cap, ale bounded by ratio ≤ 1.0).
+        let jittered = self.apply_jitter(clamped_secs);
+        Duration::from_secs_f64(jittered.min(cap_secs).max(0.0))
+    }
 }
 ```
 
@@ -1011,6 +1364,12 @@ pub enum PushError {
     // Transient DB errors (connection, IO) — caller may retry.
     #[error("database error (transient): {0}")]
     Transient(#[source] sqlx::Error),
+    // Defense-in-depth: rows_affected != expected po INSERT. Pod current
+    // single-statement INSERT...SELECT...unnest, CHECK violation rollback'uje
+    // całą statement → unreachable. Wariant zarezerwowany na future cases
+    // (np. ON CONFLICT DO NOTHING gdyby push-side dedup pojawił się w v0.2).
+    #[error("batch partial: inserted {inserted} of {expected} expected rows")]
+    BatchPartial { inserted: usize, expected: usize },
 }
 
 impl PushError {
@@ -1039,7 +1398,7 @@ pub enum BuildError {
     PollIntervalTooShort { min: Duration },
     #[error("concurrency must be >= 1")]
     ConcurrencyZero,
-    #[error("pool too small: need pool.size >= concurrency + 3 (poll/reaper/mark reservations); have {actual}, need {required}")]
+    #[error("pool too small: need max_connections >= concurrency × 2 + 2 (handler + mark_* per concurrent slot + poll + reaper); have {actual}, need {required}. Use pool.options().get_max_connections() (NOT pool.size() — lazy, 0 dla świeżego pool'a).")]
     PoolTooSmall { actual: u32, required: u32 },
     #[error("max_attempts must be >= 1")]
     MaxAttemptsZero,
@@ -1049,6 +1408,14 @@ pub enum BuildError {
     LeaseTimeoutTooShort,
     #[error("lease_timeout + reaper_interval combination impossible: lease={lease:?}, need reaper <= lease/2 but >= 1s, so lease must be >= 2s")]
     LeaseTimeoutTooShortForReaper { lease: Duration },
+    #[error("handler_timeout must be >= {min:?} (MIN_HANDLER_TIMEOUT)")]
+    HandlerTimeoutBelowFloor { min: Duration },
+    #[error("handler_timeout ({handler:?}) + 1s must be <= lease_timeout ({lease:?}); mark_retry needs margin to commit before lease expires")]
+    HandlerTimeoutTooLong { handler: Duration, lease: Duration },
+    #[error("mark_timeout must be >= 100ms")]
+    MarkTimeoutTooShort,
+    #[error("mark_timeout ({mark:?}) must be <= lease_timeout − handler_timeout ({budget:?}); else mark_* może przekroczyć lease before retry-via-reaper takes over")]
+    MarkTimeoutTooLong { mark: Duration, budget: Duration },
     #[error("reaper_interval must be <= lease_timeout / 2")]
     ReaperIntervalTooLong,
     #[error("queue name invalid: {0}")]
@@ -1143,6 +1510,7 @@ Library mapping na DB state:
 | `Ok(())` | `mark_done` (fencing-guarded) |
 | `Err(JobError::Retry { reason, retry_in })` | `mark_retry` z `run_at = now() + retry_in.unwrap_or_else(\|\| backoff.next(attempts))`; if `attempts >= max_attempts` → upgrade do `mark_dead` |
 | `Err(JobError::Abort { reason })` | `mark_dead` natychmiast (bypass retry budget) |
+| Timeout (`handler_timeout` elapsed) | future dropped na `.await` point; library traktuje jak `Err(JobError::Retry { reason: "handler_timeout", retry_in: None })` → `mark_retry` z backoff'em policy; if `attempts >= max_attempts` → upgrade do `mark_dead`. Side-effects already-issued **survive cancellation** (mitigacja: `ctx.idempotency_key`). |
 | Panic | per `PanicPolicy`: `Retry` → `mark_retry`; `Dead` → `mark_dead` z `reason = "panic: <msg>"` |
 | Codec decode error (przed wywołaniem handlera) | `mark_dead` z `reason = "payload decode: <err>"` (handler nigdy nie called — retry by miał ten sam decode-error). **Jeśli mark_dead samo zawiedzie** (DB error) — `warn!` + leave row `running`; reaper recover'i przez lease expiration → kolejne attempts spalą `max_attempts` → final `dead` z `last_error = 'lease_expired_max_attempts'`. Bounded loop, ale slow. |
 
@@ -1345,18 +1713,68 @@ go w `#[tokio::test]` setup.
 
 `WorkerHandle::shutdown(timeout: Duration) -> Result<Stats, ShutdownError>`:
 
-1. Cancel `shutdown` cancellation token → poll loop + reaper exit
-   immediately (na `tokio::select` z token).
-2. Drop semaphore permit-acquire — nowe handlery się nie spawn'ują.
-3. `JoinSet::join_next` w pętli z `tokio::time::timeout(timeout)`.
-4. Po timeout: `JoinSet::abort_all()`, czekaj na ostatnie join. Stats
-   summary.
+**`WorkerHandle` MUSI trzymać `AbortHandle` poll loop'a i reaper'a osobno
+od `state.tasks: JoinSet` (handlery).** Bez tego: `tokio::spawn(poll_loop)`
++ drop handle = detached task per Anti-pattern #12, shutdown(timeout) zwraca
+ale poll/reaper żyją w runtime aż naturalnie skończą `.await`. Konkret:
+
+```rust
+pub struct WorkerHandle {
+    state: Arc<WorkerState>,
+    poll_abort: tokio::task::AbortHandle,    // poll loop task
+    reaper_abort: tokio::task::AbortHandle,  // reaper loop task
+    poll_join: tokio::task::JoinHandle<()>,  // dla graceful wait
+    reaper_join: tokio::task::JoinHandle<()>,
+}
+
+impl WorkerHandle {
+    pub async fn shutdown(self, timeout: Duration) -> Result<Stats, ShutdownError> {
+        // 1. Soft signal: cancellation token → poll/reaper SQL await wrapped
+        //    w select widzą cancel, exit gracefully na najbliższym .await point.
+        self.state.shutdown.cancel();
+
+        // 2. Soft drain: czekaj timeout/2 na poll+reaper graceful exit.
+        //    Pod normalnych warunkach to <100ms (select wychodzi natychmiast).
+        let half = timeout / 2;
+        let _ = tokio::time::timeout(half, async {
+            let _ = self.poll_join.await;
+            let _ = self.reaper_join.await;
+        }).await;
+
+        // 3. Hard abort: poll/reaper jeśli nadal żyją (np. SQL drop nie
+        //    rozwiązał się w czasie — rzadkie ale możliwe pod pool deadlock).
+        self.poll_abort.abort();
+        self.reaper_abort.abort();
+
+        // 4. Handler drain: state.tasks JoinSet, drugi half timeout'a.
+        let drain_deadline = tokio::time::Instant::now() + (timeout - half);
+        while let Some(_) = tokio::time::timeout_at(drain_deadline,
+            self.state.tasks.lock().await.join_next()).await.ok().flatten() {}
+
+        // 5. Hard abort handlers via cascade: state.tasks.abort_all() →
+        //    handle_job unwind → local JoinSet drop → handler cancelled
+        //    (Anti-pattern #12 cascade).
+        self.state.tasks.lock().await.abort_all();
+        while let Some(_) = self.state.tasks.lock().await.join_next().await {}
+
+        // 6. Build Stats.
+        self.collect_stats()
+    }
+}
+```
+
+Krok 1 daje **immediate** observability shutdown'u (poll/reaper widzą cancel
+przy najbliższym `.await` — claim_batch/reap SQL future drop ⇒ sqlx
+server-side cancel sygnał). Krok 3 jest defense-in-depth dla case'a kiedy
+SQL wisi w pool wait beyond half-timeout.
 
 ```rust
 pub struct Stats {
     pub completed: u64,       // handlers returned Ok(()) (mark_done ack'd, rows_affected > 0)
     pub failed: u64,          // handlers returned Err(JobError::Retry/Abort) OR panicked
-    pub aborted: u64,         // handlers aborted via JoinSet::abort_all (timeout)
+    pub timed_out: u64,       // handlers cancelled via handler_timeout elapsed; mark_retry'd z reason="handler_timeout"
+    pub mark_timed_out: u64,  // mark_* SQL przekroczył mark_timeout (#3); leave row 'running', reaper przejmie
+    pub aborted: u64,         // handlers aborted via JoinSet::abort_all (worker SHUTDOWN timeout, nie handler_timeout)
     pub fenced_out: u64,      // mark_* returned 0 rows (lease lost to reaper)
     pub pending_recovery: u64,// rows still 'running' at drain (reaper will recover via lease_timeout)
 }
@@ -1407,76 +1825,124 @@ albo osobny schema w shared container — TBD per fixture cost).
 2. `tests/concurrency_behavior.rs` — N=1 sequential vs N>1 parallel.
 3. `tests/max_attempts_behavior.rs` — fail loop, dead po N attempts.
 4. `tests/lease_timeout_behavior.rs` — reaper z 1s vs 10s.
-5. `tests/reaper_interval_behavior.rs` — reaper z 1s vs 5s tick.
-6. `tests/batch_size_behavior.rs` — claim shape przy 10 vs 50.
-7. `tests/scheduled_run_at.rs` — push z run_at = now()+2s.
-8. `tests/retry_backoff_behavior.rs` — Fixed vs Exponential run_at delta.
-9. `tests/retry_in_override.rs` — `Err(JobError::Retry { retry_in: Some(5s), .. })`.
-10. `tests/panic_policy_behavior.rs` — PanicPolicy::Retry vs ::Dead.
-11. `tests/codec_swappable.rs` — JsonCodec vs custom CborCodec.
+5. `tests/handler_timeout_behavior.rs` — handler `tokio::sleep(5s)`; `handler_timeout=1s` → `mark_retry { reason: "handler_timeout" }` po ~1s; `handler_timeout=10s` → `mark_done` po ~5s. Mierzy DB-observable transition + timing.
+6. `tests/reaper_interval_behavior.rs` — reaper z 1s vs 5s tick.
+7. `tests/batch_size_behavior.rs` — claim shape przy 10 vs 50.
+   Plus: weryfikuje że `claim_batch(N)` z N>free_permits zwraca rows = free_permits (permit-gated claim, Anti-pattern #13).
+8. `tests/poll_acquires_permits_before_claim.rs` — push 100 jobów,
+   `concurrency=4`, `batch_size=50`, każdy handler `tokio::sleep(1s)`.
+   Captures per-row delta `(first_attempted_at, handler_start_real_time)` przez
+   handler-side instrumentation. Assert: dla **każdego** row delta < 100ms
+   (handler spawn natychmiast po claim). Regresja Anti-pattern #13 —
+   bez permit-gated claim test by widział delta rosnące do (batch_size/concurrency-1) × handler_duration.
+9. `tests/scheduled_run_at.rs` — push z run_at = now()+2s.
+10. `tests/retry_backoff_behavior.rs` — Fixed vs Exponential run_at delta.
+11. `tests/retry_in_override.rs` — `Err(JobError::Retry { retry_in: Some(5s), .. })`.
+12. `tests/panic_policy_behavior.rs` — PanicPolicy::Retry vs ::Dead.
+13. `tests/codec_swappable.rs` — JsonCodec vs custom CborCodec.
 
 ### Crash safety / correctness
 
-12. `tests/skip_locked_no_double_claim.rs` — 2 workery, 100 jobs, suma = 100.
-13. `tests/stale_running_reaped.rs` — manual UPDATE stale, reaper flipuje.
-14. `tests/reaper_to_dead_when_max_attempts.rs` — reaper z attempts=N+1
+14. `tests/skip_locked_no_double_claim.rs` — 2 workery, 100 jobs, suma = 100.
+15. `tests/stale_running_reaped.rs` — manual UPDATE stale, reaper flipuje.
+16. `tests/reaper_to_dead_when_max_attempts.rs` — reaper z attempts=N+1
     flipuje do dead (nie awaiting_retry).
-15. `tests/reaper_single_cte_no_race.rs` — verify że single-CTE reaper
+17. `tests/reaper_single_cte_no_race.rs` — verify że single-CTE reaper
     nie produkuje (running, awaiting_retry, dead) inconsistencies pod
     concurrent claim+reap (regresja po W1 z review).
-16. `tests/fencing_token_no_double_run.rs` — claim → manual stale → reaper
+18. `tests/fencing_token_no_double_run.rs` — claim → manual stale → reaper
     → stary handler mark_done ze starym tokenem → 0 rows.
-17. `tests/shutdown_graceful.rs` — handler trwa krócej niż timeout, drain OK.
-18. `tests/shutdown_abort_after_timeout.rs` — handler trwa dłużej, abort +
+19. `tests/shutdown_graceful.rs` — handler trwa krócej niż timeout, drain OK.
+20. `tests/shutdown_abort_after_timeout.rs` — handler trwa dłużej, abort +
     reaper recovery + correctness.
-19. `tests/shutdown_cancels_poll_loop.rs` — mid-poll-sleep shutdown
+21. `tests/shutdown_aborts_handler_no_leak.rs` — handler robi `sleep(60s)` +
+    side-effect counter (np. AtomicU64). Worker shutdown(timeout=1s) → abort_all.
+    Po 5s sprawdza że counter NIE wzrósł i task nie żyje (verify że lokalny
+    JoinSet cascade-aborted, nie detached jak `tokio::spawn` by zrobił). Regresja
+    Anti-pattern #12.
+22. `tests/shutdown_cancels_poll_loop.rs` — mid-poll-sleep shutdown
     wychodzi natychmiast.
-20. `tests/migrator_schema.rs` — schema CREATE'd, CHECKs fire, fillfactor
+23. `tests/migrator_schema.rs` — schema CREATE'd, CHECKs fire, fillfactor
     w `pg_class.reloptions`.
-21. `tests/reaper_no_advisory_lock_leak.rs` — 3 reapery parallel,
+24. `tests/reaper_no_advisory_lock_leak.rs` — 3 reapery parallel,
     `pg_locks` clean post-test.
-22. `tests/fatal_sqlx_triggers_shutdown.rs` — PgPool close mid-poll,
+25. `tests/fatal_sqlx_triggers_shutdown.rs` — PgPool close mid-poll,
     worker self-shutdown z error w stats.
 
 ### Resource limits
 
-23. `tests/resource_limits.rs` — payload > 1MiB rejected, batch > 10k
+26. `tests/resource_limits.rs` — payload > 1MiB rejected, batch > 10k
     rejected, last_error truncate, queue name length CHECK.
-24. `tests/builder_validation.rs` — wszystkie `BuildError::*` variants
-    rzucane na nieprawidłowy config.
+27. `tests/builder_validation.rs` — wszystkie `BuildError::*` variants
+    rzucane na nieprawidłowy config (włącznie z `HandlerTimeoutBelowFloor`,
+    `HandlerTimeoutTooLong`).
 
 ### Idempotency / at-least-once
 
-25. `tests/idempotency_key_stable_across_retries.rs` — handler fail 3x,
+28. `tests/idempotency_key_stable_across_retries.rs` — handler fail 3x,
     captured `ctx.idempotency_key` identical każdy attempt.
-26. `tests/at_least_once_semantics.rs` — simulate mark_done loss
+29. `tests/at_least_once_semantics.rs` — simulate mark_done loss
     (manual rollback), reaper recover, handler called 2x ten sam job
     z tym samym idempotency_key.
 
 ### Push & purge
 
-27. `tests/push_batch_throughput.rs` — 1000 single push vs batch,
+30. `tests/push_batch_throughput.rs` — 1000 single push vs batch,
     batch ≥ 5x szybszy.
-28. `tests/push_batch_order_preserved.rs` — push_batch zwraca uuidy
-    w input order.
-29. `tests/purge_done_chunked.rs` — 50k done rows, purge_done(0s)
+31. `tests/push_batch_order_preserved.rs` — push_batch zwraca client-side
+    Vec<Uuid> w input order. Insert robi rzędy w DB (kolejność wstawiania
+    nieistotna, public_id stabilne); test weryfikuje że **return value
+    Rust function'a** matches input order, **bez polegania na RETURNING**
+    (Postgres docs explicit'ie unspecified order).
+32. `tests/purge_done_chunked.rs` — 50k done rows, purge_done(0s)
     deletuje wszystkie chunkami.
-30. `tests/purge_dead_separate.rs` — purge_done nie tyka dead, vice versa.
+33. `tests/purge_dead_separate.rs` — purge_done nie tyka dead, vice versa.
 
 ### Observability
 
-31. `tests/tracing_events_emitted.rs` — capture tracing events via
+34. `tests/tracing_events_emitted.rs` — capture tracing events via
     custom subscriber, assert że dla każdej transition emitted event
     z expected attrs (job.id, status.from, status.to).
-32. `tests/dead_letter_logged.rs` — job hits max_attempts → reaper or
+35. `tests/dead_letter_logged.rs` — job hits max_attempts → reaper or
     handler emits `tracing::error!` z dead-letter context.
 
 ### No-DB / unit
 
-33. `tests/backoff_policy_unit.rs` — `BackoffPolicy::next(attempt)`.
-34. `tests/codec_json_roundtrip.rs` — Serialize → Vec<u8> → Deserialize.
-35. `tests/sqlx_error_classification.rs` — `is_fatal_sqlx` cases.
-36. `tests/truncate_safe_string.rs` — UTF-8 boundary safety w trim.
+36. `tests/backoff_policy_unit.rs` — `BackoffPolicy::next(attempt)`.
+37. `tests/codec_json_roundtrip.rs` — Serialize → Vec<u8> → Deserialize.
+38. `tests/sqlx_error_classification.rs` — `is_fatal_sqlx` cases.
+39. `tests/truncate_safe_string.rs` — UTF-8 boundary safety w trim.
+
+### v3.5 regression tests
+
+40. `tests/max_attempts_rolling_deploy.rs` — push job. Worker A z `max_attempts=3`
+    claim'uje (stamp'uje max=3 w wierszu), handler hangsze, lease wygasa.
+    Worker B z `max_attempts=5` startuje (rolling deploy) i jego reaper widzi
+    row jako stale. Assert: row → `dead` (bo `j.max_attempts=3` z claim'a A,
+    nie B's max=5). Werdykt deterministyczny. Regresja #1 v3.5.
+41. `tests/shutdown_immediate_with_pool_starvation.rs` — pool wyczerpany (user
+    trzyma wszystkie conn'y), poll loop / reaper czekają na acquire. Worker
+    `shutdown(timeout=2s)`. Assert: shutdown wraca ≤ 200ms (cancel sygnał
+    interceptowany przez `tokio::select` na SQL await, sqlx future drop =
+    server-side cancel). Bez fix: shutdown czeka pool acquire_timeout
+    (~30s default). Regresja #2 v3.5.
+42. `tests/mark_timeout_under_pool_pressure.rs` — `pool.max_connections = concurrency × 2 + 2`,
+    handlery + user kod celowo wyczerpują pool. Handler kończy `Ok(())`,
+    mark_done nie dostaje conn'a, `mark_timeout=500ms` → fire. Assert:
+    `Stats::mark_timed_out > 0`, row pozostaje `running`, reaper przejmuje
+    po `lease_timeout`. Regresja #3 v3.5.
+43. `tests/backoff_extreme_attempt_no_panic.rs` — `BackoffPolicy::Exponential
+    { factor: 10.0, cap: 24h, .. }`. Wywołaj `next(400)` → assert że zwraca
+    `cap` (24h), nie panic. `next(u32::MAX)` też. Regresja #4 v3.5.
+44. `tests/builder_validation_fresh_pool.rs` — `PgPool::connect(url).await?`
+    bezpośrednio potem `Worker::builder(pool).concurrency(4).build()`. Pool
+    `size()` jest 0 (lazy), ale `options().get_max_connections() = 10`
+    (default). Assert: build sukces. Bez fix #6: build fail z `PoolTooSmall
+    { actual: 0 }`. Regresja #6 v3.5.
+45. `tests/reaper_drains_backlog_adaptive.rs` — 10k rows manual UPDATE'd do
+    `running` z lease_expires_at='past'. Reaper startuje. Assert: zdrainowane
+    w < 30s (adaptive ticking; bez fix: 10k / 1024 = 10 ticks × 75s = 12.5min).
+    Regresja #7 v3.5.
 
 ### Anti-pattern guard (rule, nie test)
 
@@ -1493,8 +1959,10 @@ Commit `d9c4dc7`.
 ### Faza 1 — Pusher + codec + migrator
 
 - `Codec` trait + `JsonCodec` impl.
-- `Pusher::new` (fail-late validation queue name → `Result<Self, PusherInitError>`),
-  `with_codec`, `push`, `push_at`, `push_batch`.
+- `Pusher::new` (infallible — matches API sketch §"Public API"; queue-name
+  validation is fail-late w `push`/`push_batch`, zwraca
+  `PushError::QueueNameInvalid`), `with_codec`, `push`, `push_at`,
+  `push_batch`.
 - `pg_work_queue::migrator()` re-export `sqlx::migrate!("./migrations")`.
 - Resource validation (per-item + aggregate batch bytes).
 - `PushError` enum z `BatchPayloadTooLarge` + `BatchCodec { index, source }`
@@ -1523,7 +1991,7 @@ Commit `d9c4dc7`.
   `builder_validation.rs` (cross-knob rules), `mark_done_loses_to_reaper.rs`
   (W6 — fenced_out stat).
 
-### Faza 4 — poll loop + concurrency + worker identity
+### Faza 4 — poll loop + concurrency + handler_timeout + worker identity
 
 - `Worker::start()` → spawn poll loop + JoinSet. Schema check przy
   `start()` (SELECT 1 FROM pgwq.jobs LIMIT 0).
@@ -1533,13 +2001,25 @@ Commit `d9c4dc7`.
   abandoned przy shutdown mid-batch).
 - `is_fatal_sqlx()` classification z schema-level error variants
   (W3).
+- **`handle_job` wraps handler future w `tokio::time::timeout(handler_timeout, ...)`
+  spawn'ed do **lokalnego `JoinSet`** (panic isolation via
+  `JoinError::is_panic()` + cascade abort via `JoinSet::drop` —
+  Anti-pattern #12: `tokio::spawn` by leak'ował handler po outer
+  `abort_all`). Timeout elapsed → `mark_retry { reason: "handler_timeout" }`
+  z backoff'em policy; if `attempts ≥ max_attempts` → upgrade do `mark_dead`.
+  Default `handler_timeout = lease_timeout × 80%`, builder validates
+  `handler_timeout + 1s ≤ lease_timeout`.**
+- **Codec decode** wrapowany w `std::panic::catch_unwind(AssertUnwindSafe(...))`
+  (sync, no async overhead, no JoinHandle leak). Panic → mark_dead z
+  `reason = "codec panic: ..."`.
 - Tracing spans: `pgwq.poll_tick`, `.claim_batch`, `.handle_job`,
-  `.mark_*`. State transition events przez `emit_transition` helper
-  (single source, all sites).
+  `.mark_*`. `handle_job` span attrs: `timeout_ms`, plus event
+  `pgwq.handler.timeout_elapsed` przy timeout fire. State transition
+  events przez `emit_transition` helper (single source, all sites).
 - Tests: `poll_interval_behavior.rs`, `concurrency_behavior.rs`,
-  `tracing_events_emitted.rs`, `sqlx_error_classification.rs`,
-  `fatal_sqlx_triggers_shutdown.rs`, `schema_missing_fails_loud.rs`,
-  `shutdown_drains_claimed_batch.rs` (W9).
+  `handler_timeout_behavior.rs`, `tracing_events_emitted.rs`,
+  `sqlx_error_classification.rs`, `fatal_sqlx_triggers_shutdown.rs`,
+  `schema_missing_fails_loud.rs`, `shutdown_drains_claimed_batch.rs` (W9).
 
 ### Faza 5 — reaper (single-CTE, SKIP LOCKED, catch_unwind)
 
@@ -1639,6 +2119,23 @@ Szczegóły migracji rust_event_outbox z apalis na pg_work_queue
     `pgwq.job_attempts` table jako v0.2 roadmap (S23).
 16. **`queue_stats(pool) -> QueueStats`** — v0.1 helper read-only function
     dla operator cookbook (zwraca queued/running/done/dead counts).
+17. **`handler_timeout` knob** — SETTLED: required builder knob (default
+    `lease_timeout × 80%` clamped do `MIN_HANDLER_TIMEOUT=1s`; hard constraint
+    `handler_timeout + 1s ≤ lease_timeout`). Library wraps invokację w
+    `tokio::time::timeout` inside **lokalnego `JoinSet`** (panic isolation
+    przez `JoinError::is_panic()` + proper cascade cancel przez
+    `JoinSet::drop`; **nie** `tokio::spawn` — `JoinHandle::drop` detach'uje,
+    nie aborti, co leak'owałoby handler po outer abort_all — patrz Anti-pattern
+    #12). Elapsed → `mark_retry { reason: "handler_timeout" }` z normalnym
+    backoff'em policy; if `attempts ≥ max_attempts` → upgrade do `mark_dead`.
+    Reaper pozostaje **wyłącznie dla process-death recovery** (crash/OOM/
+    partycja); immediate retry bez backoff'u na tej ścieżce jest poprawne
+    (infrastruktura, nie content jobu). **Cancellation gotcha:**
+    `tokio::time::timeout` cancel'i tylko przy `.await` point — CPU-bound
+    work musi iść przez `spawn_blocking` albo periodic `yield_now`. Tests:
+    `handler_timeout_behavior.rs`, `builder_validation.rs` (cross-knob
+    `HandlerTimeoutTooLong`), `shutdown_aborts_handler_no_leak.rs` (regresja
+    Anti-pattern #12).
 
 ## Anti-patterns z których wyciągnęliśmy lekcje
 
@@ -1663,10 +2160,48 @@ Hard rules:
    driver `.unwrap()` panics.)
 10. **All user-facing strings truncated at library boundary** zanim
     wrzucą do DB lub logu. Plus DB CHECK jako backstop.
-11. **Background tasks: catch_unwind per tick + threshold escalation.**
-    Reaper tick panic — isolated via `AssertUnwindSafe + catch_unwind`,
-    log + counter. Po K=3 consecutive panic ticks → worker shutdown
-    (loud failure, surfaced przez `ShutdownError::Fatal`). Faza 5.
+11. **Background tasks: panic isolation per tick przez `tokio::spawn` +
+    `JoinError::is_panic()` + threshold escalation.** Reaper tick wrapped
+    w `tokio::spawn`, `JoinError` surface'uje panic; log + counter. Po
+    K=3 consecutive panic ticks → worker shutdown (loud failure, surfaced
+    przez `ShutdownError::Fatal`). Faza 5. **Nie używamy** `catch_unwind`
+    — brak `futures-util` deps + UnwindSafe issues z `&PgPool` w closurze
+    reapera (omówione PLAN.md:745-748).
+12. **Supervisor wrapping handler future MUSI używać `JoinSet` (lokalnego
+    albo zewnętrznego), NIE `tokio::spawn`.** Powód: `JoinHandle::drop`
+    detach'uje task (kontynuuje run), `JoinSet::drop` aborti pending tasks.
+    Jeśli supervisor sam może zostać `abort_all`'owany (handle_job w głównym
+    workerowym JoinSet podczas shutdown timeout / fatal escalation), to
+    `tokio::spawn` wewnątrz leak'uje detached handler — side-effects lecą
+    dalej, mark_* się nigdy nie wywołuje, row stoi `running` aż lease wygaśnie.
+    Z lokalnym `JoinSet` cascade abort działa poprawnie: outer abort → supervisor
+    unwind → lokalny `JoinSet` dropped → inner task aborted → handler future
+    dropped at next `.await`, Drop runs. Test regresyjny:
+    `shutdown_aborts_handler_no_leak.rs`. Faza 4.
+13. **Nigdy nie ustawiaj `lease_expires_at` (= nie inkrementuj attempts
+    przez claim_batch) zanim masz GWARANCJĘ że handler ruszy natychmiast.**
+    Konkretnie: poll loop musi acquire'ować concurrency permits PRZED
+    claim_batch, claim'ować ≤ permits, spawn'ować bez `.await` na semaphore
+    w środku spawn-after-claim loop'a. Bez tego: batch_size > free_permits
+    daje rows siedzące `running` z attempts++ i lease tykającym, czekające
+    na semaphore — przy heterogenicznych czasach handlerów (mix 100s+400s)
+    reaper przejmuje row zanim handler ruszy → mass fence-out → side-effect
+    duplikuje się przez retry-on-other-worker. Generalizacja: claim'ed row
+    = obietnica natychmiastowego handler start. Złamanie tej obietnicy
+    = at-least-once amplification proportional to (batch_size − concurrency)
+    × p99 handler duration. Tests: `poll_acquires_permits_before_claim.rs`,
+    `batch_size_behavior.rs`. Faza 4.
+14. **Każdy worker-decision SQL (reaper, library mark_retry upgrade-to-dead)
+    MUSI używać PER-ROW wartości stamped przez claim_batch, NIE worker-local
+    state.** Konkret: rolling deploy z Worker A (max_attempts=3) i Worker B
+    (max_attempts=5) na tej samej kolejce — jeśli werdykt dead-vs-retry
+    używa `state.max_attempts` (worker-local), ten sam stale row dostaje
+    różny verdict zależnie od which-replica-wins-the-lock. Non-deterministyczne
+    dead-letter dla identycznego inputu. Fix: stamp `max_attempts` jako kolumnę
+    przez claim_batch, reaper/mark_retry porównują z `j.max_attempts`.
+    Generalizacja: każdy stateful per-job config knob (max_attempts,
+    potencjalnie inne future-knoby jak retry_policy_id) MUSI być stamped
+    per-row przy claim time. Test: `max_attempts_rolling_deploy.rs`. Faza 5.
 
 ## Roadmap
 
