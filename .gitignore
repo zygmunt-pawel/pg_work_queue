@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+
+.idea/
+.vscode/
+
+# External repos cloned during research (not our code)
+research/apalis-source/
+research/apalis-postgres-source/
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target

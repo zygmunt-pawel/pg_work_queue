@@ -1,0 +1,48 @@
+[package]
+name = "pg_work_queue"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Minimal polling-based Postgres job queue for Rust"
+repository = "https://github.com/pawel/pg_work_queue"
+documentation = "https://docs.rs/pg_work_queue"
+readme = "README.md"
+keywords = ["job", "queue", "postgres", "worker", "background"]
+categories = ["database", "asynchronous"]
+
+[dependencies]
+sqlx = { version = "=0.8.6", default-features = false, features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "chrono",
+    "macros",
+    "migrate",
+] }
+tokio = { version = "=1.52.3", features = ["full"] }
+tokio-util = { version = "=0.7.18", features = ["rt"] }
+tracing = "=0.1.44"
+serde = { version = "=1.0.228", features = ["derive"] }
+thiserror = "=2.0.18"
+uuid = { version = "=1.23.1", features = ["v4", "v7", "serde"] }
+chrono = { version = "=0.4.44", default-features = false, features = ["serde", "clock"] }
+rand = "=0.10.1"
+
+[dev-dependencies]
+tokio = { version = "=1.52.3", features = ["full", "test-util"] }
+testcontainers = "=0.27.3"
+testcontainers-modules = { version = "=0.15.0", features = ["postgres"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
