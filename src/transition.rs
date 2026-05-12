@@ -25,7 +25,7 @@ use uuid::Uuid;
 /// on every `pgwq.state.transition` event so operators can attribute the
 /// flip to a specific subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Reaper` lands w Fazie 5, `Purge` w Fazie 8
+#[allow(dead_code)] // `Purge` lands w Fazie 8 (Reaper jest już used z Fazy 5)
 pub enum TransitionSource {
     /// `Worker` claimed → handler executed → `mark_*`.
     Worker,

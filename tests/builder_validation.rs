@@ -315,6 +315,64 @@ async fn pool_missing_rejected() {
     );
 }
 
+// ---- Faza 5 BuildError variants (reaper) -------------------------------
+
+#[tokio::test]
+async fn reaper_interval_too_short_rejected() {
+    // reaper_interval < 1s → ReaperIntervalTooShort.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .lease_timeout(Duration::from_secs(30))
+        .reaper_interval(Duration::from_millis(500))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::ReaperIntervalTooShort)),
+        "expected ReaperIntervalTooShort, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn reaper_interval_too_long_rejected() {
+    // lease=10s, reaper=6s → 6 > 10/2 → ReaperIntervalTooLong.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .lease_timeout(Duration::from_secs(10))
+        .reaper_interval(Duration::from_secs(6))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::ReaperIntervalTooLong { actual, max }) => {
+            assert_eq!(actual, Duration::from_secs(6));
+            assert_eq!(max, Duration::from_secs(5));
+        }
+        other => panic!("expected ReaperIntervalTooLong, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn lease_timeout_too_short_for_reaper_rejected() {
+    // lease=1500ms is in [MIN_LEASE_TIMEOUT=1s, 2*MIN_REAPER_INTERVAL=2s) →
+    // LeaseTimeoutTooShortForReaper. Use poll_interval=200ms so the
+    // `lease >= 5 × poll_interval` check (lease ≥ 1000ms) does NOT trip,
+    // letting the new reaper-floor check actually fire.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .poll_interval(Duration::from_millis(200))
+        .lease_timeout(Duration::from_millis(1500))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::LeaseTimeoutTooShortForReaper { lease }) => {
+            assert_eq!(lease, Duration::from_millis(1500));
+        }
+        other => panic!("expected LeaseTimeoutTooShortForReaper, got {other:?}"),
+    }
+}
+
 /// Regression #44 v3.5 — fresh `connect_lazy` pool has `pool.size() == 0`
 /// (no connections opened yet). Builder MUST use
 /// `pool.options().get_max_connections()`, not `pool.size()`.

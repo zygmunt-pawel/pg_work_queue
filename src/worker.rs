@@ -49,6 +49,7 @@ use crate::error::{BuildError, JobError, ShutdownError, StartError};
 use crate::job::{Job, JobContext};
 use crate::limits::{MAX_QUEUE_LEN, MIN_HANDLER_TIMEOUT, MIN_MARK_TIMEOUT, MIN_POLL_INTERVAL};
 use crate::mark::{mark_dead, mark_done, mark_retry};
+use crate::reaper::MIN_REAPER_INTERVAL;
 use crate::transition::{TransitionCtx, TransitionSource, WorkerIdentity, emit_transition};
 use crate::util::fmt_err_trimmed;
 
@@ -155,6 +156,7 @@ pub struct WorkerBuilder<T, C = JsonCodec, H = ()> {
     concurrency: Option<usize>,
     handler_timeout: Option<Duration>,
     mark_timeout: Option<Duration>,
+    reaper_interval: Option<Duration>,
     codec: C,
     handler: H,
     _payload: PhantomData<fn() -> T>,
@@ -174,6 +176,7 @@ impl<T> WorkerBuilder<T, JsonCodec, ()> {
             concurrency: None,
             handler_timeout: None,
             mark_timeout: None,
+            reaper_interval: None,
             codec: JsonCodec,
             handler: (),
             _payload: PhantomData,
@@ -257,6 +260,17 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
         self
     }
 
+    /// Reaper sweep interval — how often the reaper task wakes to flip
+    /// stale `running` rows. Default: `lease_timeout / 4`. Floor: 1s
+    /// ([`BuildError::ReaperIntervalTooShort`]). Ceiling: `lease_timeout / 2`
+    /// so the reaper ticks at least twice per lease
+    /// ([`BuildError::ReaperIntervalTooLong`]).
+    #[must_use]
+    pub const fn reaper_interval(mut self, d: Duration) -> Self {
+        self.reaper_interval = Some(d);
+        self
+    }
+
     /// Swap the codec. Default: [`JsonCodec`].
     pub fn codec<C2: Codec>(self, codec: C2) -> WorkerBuilder<T, C2, H> {
         WorkerBuilder {
@@ -270,6 +284,7 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
             concurrency: self.concurrency,
             handler_timeout: self.handler_timeout,
             mark_timeout: self.mark_timeout,
+            reaper_interval: self.reaper_interval,
             codec,
             handler: self.handler,
             _payload: PhantomData,
@@ -300,6 +315,7 @@ where
             concurrency: self.concurrency,
             handler_timeout: self.handler_timeout,
             mark_timeout: self.mark_timeout,
+            reaper_interval: self.reaper_interval,
             codec: self.codec,
             handler: Arc::new(f) as Arc<dyn JobHandler<T>>,
             _payload: PhantomData,
@@ -329,6 +345,18 @@ where
 
         if self.lease_timeout < MIN_LEASE_TIMEOUT {
             return Err(BuildError::LeaseTimeoutBelowFloor);
+        }
+
+        // Reaper floor on lease: with MIN_REAPER_INTERVAL = 1s and the
+        // `reaper_interval <= lease_timeout / 2` rule, the lease must be
+        // ≥ 2s for ANY valid reaper_interval to exist. Placed AFTER
+        // `LeaseTimeoutBelowFloor` so lease < 1s still surfaces the
+        // original variant (the existing `lease_timeout_below_floor_rejected`
+        // test stays green).
+        if self.lease_timeout < MIN_REAPER_INTERVAL.saturating_mul(2) {
+            return Err(BuildError::LeaseTimeoutTooShortForReaper {
+                lease: self.lease_timeout,
+            });
         }
 
         if self.batch_size < BATCH_SIZE_MIN || self.batch_size > BATCH_SIZE_MAX {
@@ -418,6 +446,24 @@ where
             });
         }
 
+        // reaper_interval: default = lease_timeout / 4 (clamped to floor).
+        // Constraint: floor MIN_REAPER_INTERVAL (1s) and ceiling
+        // lease_timeout / 2 so the reaper ticks at least twice per lease.
+        let lease_half = self.lease_timeout / 2;
+        let reaper_interval = self.reaper_interval.unwrap_or_else(|| {
+            let candidate = self.lease_timeout / 4;
+            candidate.max(MIN_REAPER_INTERVAL)
+        });
+        if reaper_interval < MIN_REAPER_INTERVAL {
+            return Err(BuildError::ReaperIntervalTooShort);
+        }
+        if reaper_interval > lease_half {
+            return Err(BuildError::ReaperIntervalTooLong {
+                actual: reaper_interval,
+                max: lease_half,
+            });
+        }
+
         Ok(Worker {
             pool,
             queue,
@@ -429,6 +475,7 @@ where
             concurrency,
             handler_timeout,
             mark_timeout,
+            reaper_interval,
             codec: self.codec,
             handler: self.handler,
             _payload: PhantomData,
@@ -467,6 +514,7 @@ pub struct Worker<T, C = JsonCodec> {
     concurrency: usize,
     handler_timeout: Duration,
     mark_timeout: Duration,
+    reaper_interval: Duration,
     codec: C,
     handler: Arc<dyn JobHandler<T>>,
     _payload: PhantomData<fn() -> T>,
@@ -484,6 +532,7 @@ impl<T, C> std::fmt::Debug for Worker<T, C> {
             .field("concurrency", &self.concurrency)
             .field("handler_timeout", &self.handler_timeout)
             .field("mark_timeout", &self.mark_timeout)
+            .field("reaper_interval", &self.reaper_interval)
             .finish_non_exhaustive()
     }
 }
@@ -630,6 +679,7 @@ where
             default_retry_delay: self.default_retry_delay,
             batch_size: batch_size_usize,
             poll_interval: self.poll_interval,
+            reaper_interval: self.reaper_interval,
             semaphore: Arc::new(Semaphore::new(self.concurrency)),
             shutdown: CancellationToken::new(),
             tasks: Mutex::new(JoinSet::new()),
@@ -641,10 +691,17 @@ where
         let poll_join: JoinHandle<()> = tokio::spawn(poll_loop(state_for_loop));
         let poll_abort = poll_join.abort_handle();
 
+        let state_for_reaper = state.clone();
+        let reaper_join: JoinHandle<()> =
+            tokio::spawn(crate::reaper::reaper_loop(state_for_reaper));
+        let reaper_abort = reaper_join.abort_handle();
+
         Ok(WorkerHandle {
             state,
             poll_join,
             poll_abort,
+            reaper_join,
+            reaper_abort,
         })
     }
 }
@@ -664,6 +721,7 @@ pub(crate) struct WorkerState<T, C> {
     pub(crate) default_retry_delay: Duration,
     pub(crate) batch_size: usize,
     pub(crate) poll_interval: Duration,
+    pub(crate) reaper_interval: Duration,
     pub(crate) semaphore: Arc<Semaphore>,
     pub(crate) shutdown: CancellationToken,
     pub(crate) tasks: Mutex<JoinSet<()>>,
@@ -678,6 +736,9 @@ pub struct WorkerHandle {
     poll_join: JoinHandle<()>,
     #[allow(dead_code)] // retained for Faza 7 hard-abort path
     poll_abort: AbortHandle,
+    reaper_join: JoinHandle<()>,
+    #[allow(dead_code)] // retained for Faza 7 hard-abort path
+    reaper_abort: AbortHandle,
 }
 
 impl std::fmt::Debug for WorkerHandle {
@@ -696,25 +757,40 @@ impl WorkerHandle {
         self.state.cancel_shutdown();
     }
 
-    /// Await poll loop completion + drain in-flight handlers.
+    /// Await poll loop + reaper loop completion, then drain in-flight handlers.
     ///
     /// Drains the local handler `JoinSet` until empty. Returns
-    /// [`ShutdownError::Fatal`] if the poll loop self-shutdown after a
-    /// fatal sqlx error (see [`crate::error::ShutdownError`]).
+    /// [`ShutdownError::Fatal`] if either the poll loop OR the reaper
+    /// self-shutdown after a fatal sqlx error (see
+    /// [`crate::error::ShutdownError`]).
+    ///
+    /// **Phase 5 surface gap (Phase 7 follow-up):** if the reaper task is
+    /// killed by `K = REAPER_PANIC_ESCALATION_THRESHOLD` (=3) consecutive
+    /// panic ticks, the worker self-shuts but `join()` returns `Ok(())` —
+    /// `last_fatal` is not set because no `sqlx::Error` is available. The
+    /// panic count is surfaced through `tracing::error!` events only.
+    /// Phase 7 (`shutdown(timeout) -> Result<Stats, _>`) will add a
+    /// programmatic surface for this case.
     ///
     /// # Errors
-    /// Returns [`ShutdownError::Fatal`] iff the poll loop classified a
-    /// `sqlx::Error` as fatal via `is_fatal_sqlx` before exiting.
+    /// Returns [`ShutdownError::Fatal`] iff the poll loop OR reaper task
+    /// classified a `sqlx::Error` as fatal via `is_fatal_sqlx` before
+    /// exiting.
     pub async fn join(self) -> Result<(), ShutdownError> {
         // 1) Await poll loop natural exit (already cancelled or self-shut).
         let _ = self.poll_join.await;
 
-        // 2) Drain handler JoinSet. Each handle_job task is fire-and-forget;
+        // 2) Await reaper loop natural exit. Single shared CancellationToken
+        //    in WorkerState wakes both — by the time poll_join completes the
+        //    reaper has either also seen the cancel, or will see it now.
+        let _ = self.reaper_join.await;
+
+        // 3) Drain handler JoinSet. Each handle_job task is fire-and-forget;
         //    we wait until JoinSet is empty so all mark_* commits have a
         //    chance to land.
         self.state.drain_handlers().await;
 
-        // 3) Surface fatal poll-loop error if any.
+        // 4) Surface fatal poll-loop / reaper error if any.
         if let Some(fatal) = self.state.last_fatal_snapshot() {
             return Err(ShutdownError::Fatal(fatal));
         }

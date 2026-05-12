@@ -15,6 +15,7 @@ pub mod claim;
 pub(crate) mod job;
 #[doc(hidden)]
 pub mod mark;
+pub(crate) mod reaper;
 pub(crate) mod transition;
 pub(crate) mod util;
 
@@ -39,6 +40,7 @@ pub use crate::worker::{TickStats, Worker, WorkerBuilder, WorkerHandle};
 pub mod __test_exports {
     pub use crate::claim::claim_and_decode;
     pub use crate::mark::{mark_dead, mark_done, mark_retry};
+    pub use crate::reaper::REAPER_PANIC_INJECTIONS;
     pub use crate::util::fmt_err_trimmed;
     pub use crate::worker::is_fatal_sqlx;
 }

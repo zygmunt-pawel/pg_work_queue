@@ -290,6 +290,32 @@ pub enum BuildError {
         /// Budget = `lease_timeout - handler_timeout`.
         budget: Duration,
     },
+
+    /// `reaper_interval` below 1s floor.
+    #[error("reaper_interval must be >= 1s (MIN_REAPER_INTERVAL)")]
+    ReaperIntervalTooShort,
+
+    /// `reaper_interval` exceeds `lease_timeout / 2` — reaper must tick at
+    /// least twice per lease so a stale row never sits beyond
+    /// `lease_timeout * 1.5`.
+    #[error("reaper_interval ({actual:?}) must be <= lease_timeout / 2 ({max:?})")]
+    ReaperIntervalTooLong {
+        /// Configured `reaper_interval`.
+        actual: Duration,
+        /// Maximum allowed = `lease_timeout / 2`.
+        max: Duration,
+    },
+
+    /// `lease_timeout < 2s` — cannot fit a `reaper_interval` in
+    /// `[1s, lease/2]`.
+    #[error(
+        "lease_timeout ({lease:?}) is too short for reaper: requires >= 2s so reaper_interval \
+         fits in [1s, lease/2]"
+    )]
+    LeaseTimeoutTooShortForReaper {
+        /// Configured `lease_timeout`.
+        lease: Duration,
+    },
 }
 
 /// Errors returned by [`crate::worker::Worker::start`].
