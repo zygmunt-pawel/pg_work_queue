@@ -31,10 +31,17 @@ struct Payload {
 }
 
 fn dummy_pool() -> sqlx::PgPool {
+    dummy_pool_with(64)
+}
+
+fn dummy_pool_with(max_conn: u32) -> sqlx::PgPool {
     // connect_lazy: no actual TCP connection until first query. Builder
-    // validation never queries — pool is only stored.
+    // validation never queries — pool is only stored. We size the lazy
+    // pool large enough to satisfy `concurrency × 2 + 2` for any sensible
+    // default concurrency (≤ #CPUs); tests that want to probe `PoolTooSmall`
+    // pass a small max via `dummy_pool_with`.
     PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(max_conn)
         .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/none")
         .expect("connect_lazy ok")
 }
@@ -162,4 +169,169 @@ async fn defaults_plus_queue_and_handler_ok() {
         .handler(handler_ok())
         .build();
     assert!(res.is_ok(), "valid config must build; got {res:?}");
+}
+
+// ---- Faza 4 BuildError variants ----------------------------------------
+
+#[tokio::test]
+async fn poll_interval_too_short_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .poll_interval(Duration::from_millis(1))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::PollIntervalTooShort { min }) => {
+            assert_eq!(min, pg_work_queue::limits::MIN_POLL_INTERVAL);
+        }
+        other => panic!("expected PollIntervalTooShort, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn concurrency_zero_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .concurrency(0)
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::ConcurrencyZero)),
+        "expected ConcurrencyZero, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn pool_too_small_rejected() {
+    // pool.max_connections = 4 but concurrency = 4 requires 4*2+2 = 10.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .concurrency(4)
+        .pool(dummy_pool_with(4))
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::PoolTooSmall { actual, required }) => {
+            assert_eq!(actual, 4);
+            assert_eq!(required, 10);
+        }
+        other => panic!("expected PoolTooSmall, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn lease_timeout_too_short_for_poll_rejected() {
+    // poll_interval=1s → lease must be >= 5s. 3s falls short.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .poll_interval(Duration::from_secs(1))
+        .lease_timeout(Duration::from_secs(3))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::LeaseTimeoutTooShort)),
+        "expected LeaseTimeoutTooShort, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn handler_timeout_below_floor_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .lease_timeout(Duration::from_secs(60))
+        .handler_timeout(Duration::from_millis(500))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::HandlerTimeoutBelowFloor { min }) => {
+            assert_eq!(min, pg_work_queue::limits::MIN_HANDLER_TIMEOUT);
+        }
+        other => panic!("expected HandlerTimeoutBelowFloor, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn handler_timeout_too_long_rejected() {
+    // lease=10s, handler=10s → 10+1 > 10, must reject.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .lease_timeout(Duration::from_secs(10))
+        .handler_timeout(Duration::from_secs(10))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::HandlerTimeoutTooLong { .. })),
+        "expected HandlerTimeoutTooLong, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn mark_timeout_too_short_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .lease_timeout(Duration::from_secs(30))
+        .handler_timeout(Duration::from_secs(20))
+        .mark_timeout(Duration::from_millis(50))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::MarkTimeoutTooShort)),
+        "expected MarkTimeoutTooShort, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn mark_timeout_too_long_rejected() {
+    // lease=30s, handler=20s, budget=10s, request mark=15s.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .lease_timeout(Duration::from_secs(30))
+        .handler_timeout(Duration::from_secs(20))
+        .mark_timeout(Duration::from_secs(15))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::MarkTimeoutTooLong { .. })),
+        "expected MarkTimeoutTooLong, got {res:?}"
+    );
+}
+
+#[tokio::test]
+async fn pool_missing_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .handler(handler_ok())
+        .build();
+    assert!(
+        matches!(res, Err(BuildError::PoolMissing)),
+        "expected PoolMissing, got {res:?}"
+    );
+}
+
+/// Regression #44 v3.5 — fresh `connect_lazy` pool has `pool.size() == 0`
+/// (no connections opened yet). Builder MUST use
+/// `pool.options().get_max_connections()`, not `pool.size()`.
+#[tokio::test]
+async fn fresh_pool_max_connections_validated_not_size() {
+    // size() = 0 on a lazy pool; get_max_connections() = 64 here.
+    let pool = dummy_pool_with(64);
+    assert_eq!(pool.size(), 0, "lazy pool has no opened conns yet");
+
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .concurrency(4)
+        .pool(pool)
+        .handler(handler_ok())
+        .build();
+    assert!(
+        res.is_ok(),
+        "valid config with fresh lazy pool must build; got {res:?}"
+    );
 }

@@ -27,6 +27,11 @@ pub const MIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// aborted. Lower bound for builder validation.
 pub const MIN_HANDLER_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Minimum `mark_timeout`. Below this the `mark_*` SQL cannot reliably
+/// commit under any non-trivial network conditions. Lower bound for
+/// builder validation.
+pub const MIN_MARK_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Reaper sweep batch size (rows per tick).
 pub const REAPER_BATCH_SIZE: usize = 1024;
 

@@ -43,8 +43,9 @@ pub(crate) async fn pg18_pool() -> (PgPool, ContainerAsync<Postgres>) {
         .await
         .expect("container port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    // 32 = enough for concurrency=#CPUs (up to ~14) × 2 + 2.
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(32)
         .connect(&url)
         .await
         .expect("connect pg18 pool");

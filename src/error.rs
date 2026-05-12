@@ -7,6 +7,7 @@
 //! `JobError` is the handler-side error type; `BuildError` is returned by
 //! `WorkerBuilder::build()` for invalid configurations.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -179,10 +180,10 @@ impl JobError {
 
 /// Errors produced by `WorkerBuilder::build()` for invalid configuration.
 ///
-/// In Faza 3 only the variants relevant to Phase-3 knobs are implemented.
-/// Variants for `poll_interval`, `concurrency`, `handler_timeout`,
-/// `mark_timeout`, `reaper_interval` land in Fazach 4-7 along with the
-/// corresponding builder knobs (PLAN.md lines 1395-1425).
+/// Faza 4 adds variants for `poll_interval`, `concurrency`,
+/// `handler_timeout`, `mark_timeout` knobs and `PoolMissing` /
+/// `PoolTooSmall` / `LeaseTimeoutTooShort`. `ReaperIntervalTooLong` lands
+/// in Faza 5 (PLAN.md lines 1395-1425).
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum BuildError {
@@ -195,6 +196,12 @@ pub enum BuildError {
     #[error("lease_timeout must be >= 1s (MIN_LEASE_TIMEOUT)")]
     LeaseTimeoutBelowFloor,
 
+    /// `lease_timeout` must be at least `5 × poll_interval` so a worker
+    /// has at least 5 poll cycles to finish `mark_*` commits before the
+    /// reaper claws the row back.
+    #[error("lease_timeout must be >= 5 * poll_interval")]
+    LeaseTimeoutTooShort,
+
     /// Queue name empty or exceeds `limits::MAX_QUEUE_LEN`.
     #[error("queue name invalid: {0:?}")]
     QueueNameInvalid(String),
@@ -202,6 +209,10 @@ pub enum BuildError {
     /// `.handler()` was not called before `.build()`.
     #[error("handler not set")]
     HandlerMissing,
+
+    /// `.pool()` was not called before `.build()`.
+    #[error("pool not set")]
+    PoolMissing,
 
     /// `batch_size` outside the supported range `1..=1000`.
     #[error("batch_size {actual} out of range [{min}, {max}]")]
@@ -213,4 +224,106 @@ pub enum BuildError {
         /// Inclusive maximum.
         max: u32,
     },
+
+    /// `poll_interval` below the floor in `limits::MIN_POLL_INTERVAL`.
+    #[error("poll_interval must be >= {min:?}")]
+    PollIntervalTooShort {
+        /// Floor (`limits::MIN_POLL_INTERVAL`).
+        min: Duration,
+    },
+
+    /// `concurrency == 0` — no handler would ever run.
+    #[error("concurrency must be >= 1")]
+    ConcurrencyZero,
+
+    /// Pool's configured `max_connections` is too small for the requested
+    /// concurrency. Bound: `concurrency × 2 + 2`. Read via
+    /// `pool.options().get_max_connections()`, **not** `pool.size()` —
+    /// the latter is lazy and reports 0 for fresh pools (v3.5 regression #6).
+    #[error(
+        "pool too small: need max_connections >= concurrency × 2 + 2 (handler + mark_* \
+         per concurrent slot + poll + reaper); have {actual}, need {required}. Use \
+         pool.options().get_max_connections() (NOT pool.size() — lazy, 0 dla świeżego \
+         pool'a)."
+    )]
+    PoolTooSmall {
+        /// Pool's `get_max_connections()`.
+        actual: u32,
+        /// Minimum required: `concurrency × 2 + 2`.
+        required: u32,
+    },
+
+    /// `handler_timeout` below `limits::MIN_HANDLER_TIMEOUT`.
+    #[error("handler_timeout must be >= {min:?} (MIN_HANDLER_TIMEOUT)")]
+    HandlerTimeoutBelowFloor {
+        /// Floor (`limits::MIN_HANDLER_TIMEOUT`).
+        min: Duration,
+    },
+
+    /// `handler_timeout + 1s` exceeds `lease_timeout` — `mark_retry` needs
+    /// margin to commit before the lease expires.
+    #[error(
+        "handler_timeout ({handler:?}) + 1s must be <= lease_timeout ({lease:?}); \
+         mark_retry needs margin to commit before lease expires"
+    )]
+    HandlerTimeoutTooLong {
+        /// Configured `handler_timeout`.
+        handler: Duration,
+        /// Configured `lease_timeout`.
+        lease: Duration,
+    },
+
+    /// `mark_timeout` below `limits::MIN_MARK_TIMEOUT` (100ms).
+    #[error("mark_timeout must be >= 100ms")]
+    MarkTimeoutTooShort,
+
+    /// `mark_timeout` exceeds `lease_timeout - handler_timeout` — without
+    /// margin a `mark_*` may keep running past lease expiry, allowing the
+    /// reaper to flip the row before the worker's mark commits.
+    #[error(
+        "mark_timeout ({mark:?}) must be <= lease_timeout − handler_timeout ({budget:?}); \
+         else mark_* może przekroczyć lease before retry-via-reaper takes over"
+    )]
+    MarkTimeoutTooLong {
+        /// Configured `mark_timeout`.
+        mark: Duration,
+        /// Budget = `lease_timeout - handler_timeout`.
+        budget: Duration,
+    },
+}
+
+/// Errors returned by [`crate::worker::Worker::start`].
+///
+/// `SchemaMissing` is the loud-fail surface for the start-time schema
+/// probe (`SELECT 1 FROM pgwq.jobs LIMIT 0`). Operators who forgot to run
+/// the migrator see this immediately instead of an infinite warn loop
+/// (Apalis anti-pattern). Other sqlx errors during start (network drop
+/// etc.) surface via `Database`.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum StartError {
+    /// `pgwq` schema is not present — operator must run
+    /// [`crate::migrator`] before calling `start`.
+    #[error("schema check failed (run pg_work_queue::migrator first?): {0}")]
+    SchemaMissing(#[source] sqlx::Error),
+    /// Any other `sqlx::Error` raised during the start-time probe (network,
+    /// pool acquire timeout, etc.). Transient — retry the entire `start`.
+    #[error("other DB error during start: {0}")]
+    Database(#[source] sqlx::Error),
+}
+
+/// Errors returned by `WorkerHandle::join` after the poll loop exits.
+///
+/// Faza 4 surfaces only the `Fatal` variant — fired when the poll loop
+/// classifies a `sqlx::Error` as fatal via `is_fatal_sqlx` and self-shuts
+/// down. Faza 7 adds `AlreadyShutdown` and `Timeout` for the richer
+/// `shutdown(timeout)` API.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum ShutdownError {
+    /// Worker self-shut-down after a fatal `sqlx::Error` in the poll loop.
+    /// `Arc<sqlx::Error>` because `WorkerState::last_fatal` is shared with
+    /// other observers (Faza 7 `Stats` snapshot).
+    #[error("worker failed with fatal error: {0}")]
+    Fatal(Arc<sqlx::Error>),
 }
