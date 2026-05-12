@@ -1,8 +1,13 @@
-//! Public error enums for the push side.
+//! Public error enums for the push side, handler side and builder side.
 //!
 //! See PLAN.md §"Error semantics & handling". `PushError` distinguishes
 //! caller-bug variants (deterministic — fix the input, don't loop) from
 //! transient infrastructure failures (`is_retriable() == true`).
+//!
+//! `JobError` is the handler-side error type; `BuildError` is returned by
+//! `WorkerBuilder::build()` for invalid configurations.
+
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -115,4 +120,97 @@ impl From<sqlx::Error> for PushError {
         }
         Self::Transient(e)
     }
+}
+
+/// Handler-side error: signals retry-vs-abort intent for the library.
+///
+/// See PLAN.md §"Handler signature & error semantics" (lines 1442-1478).
+/// Use [`JobError::retry`], [`JobError::retry_in`], [`JobError::abort`]
+/// ctor helpers. `reason` strings are truncated library-side via
+/// `fmt_err_trimmed` before being persisted to `last_error`.
+#[derive(Error, Debug)]
+pub enum JobError {
+    /// Job miał transient issue — library decyduje retry-vs-dead na
+    /// bazie `attempts < max_attempts`. Optional `retry_in` override
+    /// backoff policy dla tego konkretnego retry. W Fazie 3 backoff
+    /// jest stałą (`default_retry_delay`); per-job `retry_in` ma priorytet.
+    #[error("retry: {reason}")]
+    Retry {
+        /// Operator-visible category for the retry (do NOT include PII).
+        reason: String,
+        /// Optional override of the per-builder default retry delay.
+        retry_in: Option<Duration>,
+    },
+    /// Job permanently can't proceed — `mark_dead` direct (bypass retry
+    /// budget). Użyj gdy retry nigdy nie pomoże (invalid input,
+    /// permissions denied, etc.).
+    #[error("abort: {reason}")]
+    Abort {
+        /// Operator-visible category for the abort (do NOT include PII).
+        reason: String,
+    },
+}
+
+impl JobError {
+    /// Construct a `Retry` variant with no explicit delay; library applies
+    /// `default_retry_delay` from the worker builder.
+    pub fn retry(reason: impl Into<String>) -> Self {
+        Self::Retry {
+            reason: reason.into(),
+            retry_in: None,
+        }
+    }
+
+    /// Construct a `Retry` variant with an explicit delay override.
+    pub fn retry_in(reason: impl Into<String>, retry_in: Duration) -> Self {
+        Self::Retry {
+            reason: reason.into(),
+            retry_in: Some(retry_in),
+        }
+    }
+
+    /// Construct an `Abort` variant — bypass retry budget, mark dead directly.
+    pub fn abort(reason: impl Into<String>) -> Self {
+        Self::Abort {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Errors produced by `WorkerBuilder::build()` for invalid configuration.
+///
+/// In Faza 3 only the variants relevant to Phase-3 knobs are implemented.
+/// Variants for `poll_interval`, `concurrency`, `handler_timeout`,
+/// `mark_timeout`, `reaper_interval` land in Fazach 4-7 along with the
+/// corresponding builder knobs (PLAN.md lines 1395-1425).
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum BuildError {
+    /// `max_attempts == 0` — no attempt would ever fire.
+    #[error("max_attempts must be >= 1")]
+    MaxAttemptsZero,
+
+    /// `lease_timeout < 1s` — too tight to safely commit `mark_*` before
+    /// the reaper claws back the row.
+    #[error("lease_timeout must be >= 1s (MIN_LEASE_TIMEOUT)")]
+    LeaseTimeoutBelowFloor,
+
+    /// Queue name empty or exceeds `limits::MAX_QUEUE_LEN`.
+    #[error("queue name invalid: {0:?}")]
+    QueueNameInvalid(String),
+
+    /// `.handler()` was not called before `.build()`.
+    #[error("handler not set")]
+    HandlerMissing,
+
+    /// `batch_size` outside the supported range `1..=1000`.
+    #[error("batch_size {actual} out of range [{min}, {max}]")]
+    BatchSizeOutOfRange {
+        /// Configured value that failed validation.
+        actual: u32,
+        /// Inclusive minimum.
+        min: u32,
+        /// Inclusive maximum.
+        max: u32,
+    },
 }
