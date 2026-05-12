@@ -1,11 +1,11 @@
-# pg_work_queue — plan i przemyślenia (v1, post-research)
+# pg_work_queue — plan i przemyślenia (v2, post-multi-agent-review)
 
 > Status: design draft, pre-implementation. Konwencja po polsku
 > (kod/identyfikatory po angielsku) — zgodnie z `rust_event_outbox`.
-> Wersja v1 zaktualizowana po cross-referencu źródła apalisa (rc.9 monorepo
-> + rc.8 split repo `apalis-dev/apalis-postgres`) i analizie ekosystemu
-> (River, gue, pg-boss, Solid Queue, Que, neoq). Szczegóły researchu w
-> `research/SYNTHESIS.md` + trzech raportach pomocniczych.
+> Wersja v2: zaktualizowana po **9-agentowym review** (failure-rollback,
+> race-conditions, reinventing-wheels, verbose-design, resource-exhaustion,
+> audit-trail, error-handling, security, duplication) + Opus 4.7 review.
+> Backup wersji: PLAN_v0_original.md, PLAN_v1_pre_review.md.
 
 ## Co to jest
 
@@ -23,99 +23,147 @@ worker dashboard / multi-backend abstraction.
 Pierwszy konsument: `rust_event_outbox` (v0.6+), który dropuje apalis
 całkowicie i używa `pg_work_queue` jako warstwy worker pool.
 
-## Motywacja — dlaczego nie apalis
+## Motywacja — co apalis-postgres robi źle
 
 `apalis-postgres` jest w aktywnej re-architekturze: PR #586 (rc.1) wyciął
-backendy z monorepo do osobnych repo. Aktualny stan:
+backendy z monorepo do osobnych repo (`apalis-dev/apalis-postgres` —
+repo utworzone 2025-08-19, pierwsza alpha 2025-10-25, cykl rc.1 →
+rc.8 w pół roku, silently-breaking changes — np. payload JSONB → BYTEA).
 
-- `apalis-dev/apalis-postgres` — repo utworzone 2025-08-19, pierwsza alpha
-  2025-10-25, obecnie w cyklu rc.1 (grudzień 2025) → rc.8 (maj 2026).
-- Wcześniej Postgres żył w `apalis-sql` w starym monorepo. Te dwie wersje
-  mają silently-breaking API differences (np. payload column JSONB → BYTEA).
+Krzywizujący użytkownik ma trzy opcje: (a) zostać na rc.7 z znanymi
+bugami, (b) skoczyć na ruchomy cel rc.x bez gwarancji że bugi są
+fixnięte, (c) napisać własne. Wybieramy (c).
 
-Przy tej turbulencji, plus seria niezamkniętych issues, krybsujący użytkownik
-ma trzy opcje: (a) zostać na rc.7 z znanymi bugami, (b) skoczyć na ruchomy
-cel rc.x bez gwarancji że bugi są fixnięte, (c) napisać własne. Wybieramy
-(c).
+### Konkretne bugi i ograniczenia (zweryfikowane na źródle rc.8):
 
-Konkretne, zweryfikowane na źródle problemy w apalis-postgres rc.8:
-
-1. **`PgPollFetcher::next_backoff` hardcoduje `1s → 5min` exponential cap.**
-   `Config::with_poll_interval(MultiStrategy)` jest zapisywany do
-   `self.config`, ale fetcher go **nigdy nie czyta**
-   (`apalis-postgres/src/fetcher.rs:84,160-163`). Dead-code w rc.7 i rc.8.
-2. **Trigger `pg_notify('apalis::job::insert', ...)` emitowany per INSERT**
-   (`migrations/20251018165121_notify_run_at.sql`). NOTIFY przy commit
-   bierze `LWLock NotifyQueueLock` (≡ `AccessExclusiveLock` na locktype=
-   `database` w `pg_locks`) — serializuje wszystkie NOTIFY-issuing
-   commits cluster-wide. Recall.ai publicznie udokumentował tę
-   patologię w `postgres-listen-notify-does-not-scale` (marzec 2025); ich
-   case jest library-agnostic ale opisany pattern (NOTIFY-per-INSERT przy
-   write-heavy workload) pasuje 1:1 do tego co apalis robi. Outbox jest
-   write-heavy z natury → unikalibyśmy NOTIFY na zasadzie precedence.
-3. **`ack=UPDATE` zamiast DELETE** (`queries/task/ack.sql`). Konsekwencja:
-   row accumulation w queue table, user musi cron'ować `vacuum()`.
-4. **`RetryAfterError(_, duration)` — `get_duration()` ma zero callers
-   w całym crate.** Duration jest dead-code. Plain `Transient` retry semantics.
+1. **Dead-code `Config::with_poll_interval`** — `PgPollFetcher::next_backoff`
+   hardcoduje `1s → 5min` cap (`fetcher.rs:84,160-163`); config nigdy
+   nie czytany. Knob istnieje w API, nic nie robi.
+2. **`pg_notify` trigger per INSERT** (`migrations/20251018165121_notify_run_at.sql`).
+   Commit-NOTIFY bierze `LWLock NotifyQueueLock` (`AccessExclusiveLock`
+   na locktype=`database`) → serializuje wszystkie NOTIFY-issuing
+   commits cluster-wide. Recall.ai publicznie udokumentował tę patologię
+   (`postgres-listen-notify-does-not-scale`, marzec 2025).
+3. **`ack=UPDATE` not DELETE** (`queries/task/ack.sql`) → row accumulation;
+   user musi cron'ować `vacuum()`.
+4. **`RetryAfterError(_, duration)` dead-field** — `get_duration()` ma
+   zero callers w całym crate; nigdy nie wpływa na `run_at`.
 5. **Triple retry budget** — apalis `RetryPolicy::retries(N)` (in-memory)
-   + DB `attempts` column + DB `max_attempts` w shared logic. In-memory
-   counter **resetuje się** per worker lease, czyli crashed worker
-   zeruje retry budget. Authoritative source-of-truth jest niejasny.
-6. **Live bugs w rc.8:**
-   - `AbortError` branch w `calculate_status` (`src/ack.rs:70`) jest
-     **literalnie zakomentowany** — aborty po cichu stają się `Failed`
-     i są retry'owane do `max_attempts`.
-   - Worker registration leakuje session-scoped advisory locki —
-     `pg_try_advisory_lock(hashtext(workers.id))` w `register.sql` nigdy
-     nie jest released; trzymane przez sqlx pool connection
-     indefinitely.
-   - Reaper join-to-workers race — `reenqueue_orphaned` requires
-     `INNER JOIN apalis.workers`; jeśli worker row jest purged (manual
-     cleanup), jego locked jobs **stuck permanently**.
-   - `metrics::global` wykonuje 24 full-table scans `apalis.jobs` per
-     call.
-   - `Shared` driver `.unwrap()` na listener-connect / listen / send —
-     panic na transient connection issue.
-   - `wait_for` to 500ms sleep-poll z `.unwrap()` panics w hot path.
-   - `queries/backend/stats.sql` jest SQLite syntax (`?1` placeholdery)
-     w postgres queries dir. Unused dead code — sygnał słabej discipline.
-7. **Schema warts:** brak `CHECK`/`ENUM` na `status` column; redundant
-   indexes; brak composite indeksu na hot fetch path `(job_type, status,
-   run_at)`; PRIMARY KEY-e dodane dopiero w rc.1 (po 5 latach lifetime).
+   + DB `attempts` + DB `max_attempts`. In-memory counter resetuje się
+   per worker lease (crashed worker = retry budget reset).
+6. **Live bugs w rc.8:** `AbortError` branch zakomentowany w
+   `calculate_status:70` (aborty silently → Failed); worker registration
+   advisory lock leak; reaper join-to-workers race (purged worker row
+   = jego jobs stuck); `metrics::global` = 24 full-table scans per call;
+   `Shared` driver `.unwrap()` na listener-connect/listen/send;
+   `wait_for` = 500ms sleep-poll z `.unwrap()` panics; broken SQLite-
+   syntax stats query w postgres queries dir.
+7. **Schema warts:** brak `CHECK`/`ENUM` na status; brak composite indeksu
+   `(job_type, status, run_at)`; redundant indexes; PRIMARY KEY-e
+   dodane dopiero w rc.1 (po 5 latach lifetime).
 
-Wynik audytu: każdy z tych warts wymagałby workaroundu / hacka w
-`rust_event_outbox`. `pg_work_queue` eliminuje wszystkie naraz przez
-nie używanie apalis w ogóle.
+### API ergonomics warts:
+
+8. **`Backend` trait + Tower middleware stack** — custom Backend impl
+   wymaga reimplementacji ~2.2 k LOC; `apalis-core` ~11 k LOC trzeba
+   zrozumieć żeby cokolwiek customować.
+9. **`Monitor` lifecycle complexity** — restart policies, factory
+   parametryzacja, multi-stage shutdown.
+10. **`service_fn` / `taskfn` macro** — typing/lifetime issues w handlerach.
+11. **Multi-backend abstraction leakage** — `apalis::prelude::*` eksportuje
+    rzeczy które nie zawsze apply per-backend, surprising failures.
+12. **Status as plain `TEXT`** — DB nie chroni przed state machine bugami;
+    apalis łapie je w app-level CHECK logice, my łapiemy w DB CHECK.
+13. **Brak fencing token** w `mark_*` queries — race window między
+    reaperem a starym workerem realny.
+
+## Co rozwiązujemy z apalis-postgres — explicit mapping
+
+| Apalis pain point | Rozwiązanie w pgwq |
+|---|---|
+| Config knobs nieczytane w hot-path (#1) | **Hard rule:** każdy knob ma behavioral test 2-wartościowy. PR review odrzuca knob bez testu. |
+| `pg_notify` per INSERT cluster lock (#2) | **No LISTEN/NOTIFY w ogóle.** Polling-only. Deterministyczny `poll_interval`. |
+| `ack=UPDATE` accumulation (#3) | `mark_done` → status='done' + finished_at; user wywołuje `pgwq::purge_done(pool, ttl)` ręcznie kiedy chce. Manual control, no surprise. |
+| RetryAfter duration ignored (#4) | `Outcome::Retry { in_: Some(d) }` przekłada się 1:1 na `run_at = now() + d` w `mark_retry` SQL. Test: `tests/retry_in_override.rs`. |
+| Triple retry counter (#5) | **DB-side `attempts` jest single source of truth.** Brak in-memory retry budget. Reaper i mark_* używają tej samej kolumny. |
+| AbortError commented out (#6a) | Code review hard-rule: zero commented-out kodu w state-machine logic (PR-blocker). |
+| Advisory lock leak (#6b) | **Nie używamy advisory locków w ogóle.** Reaper przez SKIP LOCKED. |
+| Reaper join race (#6c) | **Brak `pgwq.workers` table.** Reaper widzi tylko `jobs.last_attempted_at` + `lease_token`. |
+| metrics 24 full scans (#6d) | **Brak `metrics::global` API.** Observability przez `tracing` events + DB queries po queue table. User buduje swój dashboard. |
+| `.unwrap()` w hot path (#6e,f) | `Cargo.toml`: `unwrap_used = "deny"`, `expect_used = "deny"`, `panic = "deny"`. Nie skompiluje się. |
+| Broken stats.sql (#6g) | TDD + verify-before-completion: każda query exercised w teście. |
+| No CHECK on status (#7) | `pgwq.job_status` ENUM + `jobs_status_invariants CHECK` z explicit `(status, attempts, *_at, lease_token)` invariantami. |
+| `Backend` trait abstraction (#8) | **Brak Backend trait.** Library jest postgres-only, no abstraction layer. ~1.5–3 k LOC vs 13.8 k LOC apalis. |
+| `service_fn` macro (#10) | Handler jest po prostu `async fn(T, JobContext) -> Outcome`. Zero macro, zero lifetime puzzles. |
+| `Monitor` complexity (#9) | `Worker::start() -> WorkerHandle`; `WorkerHandle::shutdown(timeout) -> Result<Stats>`. Jedna metoda, jeden cancellation token. |
+| Multi-backend leakage (#11) | Single-backend; `pgwq::*` re-eksportuje tylko to co aktualnie używa. |
+| Status as plain TEXT (#12) | ENUM + CHECK invariants enforced w DB. |
+| No fencing token (#13) | `lease_token UUID` column. Każdy `mark_*` ma `WHERE id=$1 AND status=$2 AND lease_token=$3`. |
 
 ## Co `pg_work_queue` świadomie NIE robi (anti-features)
 
-- **Brak `LISTEN/NOTIFY`.** Commit-NOTIFY serializuje cluster-wide. Dla
-  write-heavy queue to nieakceptowalne ryzyko. Zawsze poll.
-- **Brak adaptive / exponential backoff na pollerze.** Cadence jest
-  deterministyczna (`poll_interval`). User chce 500ms → poll co 500ms.
-  Trade-off load-vs-latency robi user explicit. (Retry backoff dla
-  handler errors to osobna sprawa — patrz `Outcome::Retry`.)
-- **Brak multi-backend abstraction.** Postgres-only by design.
-- **Brak worker dashboard / GUI / metrics endpoint.** Observability
-  przez `tracing` spans + DB queries po queue table.
-- **Brak typed retry strategies w handler API.** Handler zwraca
-  `Outcome::Retry { reason, in_: Option<Duration> }` lub
-  `Outcome::Dead { reason }`. Library decyduje retry-vs-dead po
-  `attempts < max_attempts`. Backoff dla retry: jeśli `in_` = `Some(d)`
-  user override; jeśli `None` używamy `retry_backoff` policy z konfiguracji
-  (default: exponential z jitter).
-- **Brak cross-worker priorities, fairness, multi-tenant isolation
-  beyond `queue` column.** Trzymamy się prostoty. Jeden queue name =
-  jeden FIFO stream tasks.
-- **Brak Tower middleware stack.** Apalis to robi (timeout/retry/limit/
-  catch-panic jako tower layers); my po prostu wywołujemy `handler.call`
-  w `JoinSet` ze `tokio::time::timeout` na lease_timeout i `AssertUnwindSafe`
-  catch-panic. ~30 LOC zamiast 300+ apalis-core.
+- **Brak `LISTEN/NOTIFY`.** Commit-NOTIFY serializuje cluster-wide.
+- **Brak adaptive backoff na pollerze.** Cadence deterministyczna.
+- **Brak multi-backend abstraction.** Postgres-only.
+- **Brak worker dashboard / GUI / metrics endpoint.**
+- **Brak Tower middleware stack.**
+- **Brak typed retry strategies w handler API.** Tylko `Outcome::Retry { reason, in_: Option<Duration> }` lub `Outcome::Dead { reason }`.
+- **Brak cross-worker priorities / fairness.**
+- **Brak automatycznego retention sweepera.** User wywołuje `pgwq::purge_done` / `pgwq::purge_dead` ręcznie kiedy chce (cron, tokio interval, manual). Library nie spawn'uje background cleanup task — user ma pełną kontrolę kiedy DELETE leci.
+- **Brak push-side dedup column (`unique_key TEXT UNIQUE`)** w v0.1. User może zrobić własny `INSERT...ON CONFLICT` przed `Pusher::push` jeśli potrzeba.
+- **Brak Worker registration table** (`pgwq.workers`). Lessons z apalisa.
+
+## Delivery semantics & idempotency
+
+**`pg_work_queue` daje at-least-once delivery.** Handler **MOŻE** być
+zawołany ≥1 raz dla tego samego logicznego jobu. Konkretnie:
+
+- Handler kończy się sukcesem, `mark_done` query traci connection
+  zanim commit się zarejestruje → reaper flipuje, kolejny worker
+  re-execute.
+- Reaper flipuje row do `awaiting_retry` przez `lease_timeout` (worker
+  cię handler trwa dłużej niż lease) → stary handler kończy się i
+  jego `mark_done` 0-rows-affected (fencing token mismatch), ale
+  side-effect już się wykonał. Reaper-spawned retry wykonuje go ponownie.
+- Worker proces crashuje po handler success ale przed `mark_done`
+  commit → reaper recovery, nowy worker retry.
+
+### Handler-side idempotency contract
+
+`JobContext` zawiera pole **`idempotency_key: Uuid`** które:
+
+1. Jest **stabilne across retries** dla tego samego jobu (= `public_id`
+   ustawione na push).
+2. Jest **unikalne per logical operation** (UUIDv7, near-zero collision).
+3. Jest **przekazywane do handlera w każdym attempt**.
+
+Handler który **musi** wykonać external side-effect dokładnie raz
+(np. SMTP send, payment charge, webhook POST) **musi** używać
+`idempotency_key` do dedup'u:
+
+```rust
+.handler(|task: ChargeTask, ctx: JobContext| async move {
+    // Dedupe via idempotency_key — repeated invocations are no-ops.
+    if redis.get(format!("charge:{}", ctx.idempotency_key)).await?.is_some() {
+        return Outcome::Done;
+    }
+    stripe.charge(task.amount, &ctx.idempotency_key.to_string()).await?;
+    redis.set(format!("charge:{}", ctx.idempotency_key), "1").await?;
+    Outcome::Done
+})
+```
+
+Library **nie ma sposobu** dać exactly-once external side-effects.
+To jest fundamentalny limit każdej polling queue. **Handler dostaje
+narzędzie (`idempotency_key`); użycie jest jego odpowiedzialnością.**
+
+External APIs (Stripe, AWS, etc.) standardowo wspierają `idempotency_key`
+header — nasz UUID v7 jest perfect fit.
 
 ## Public API — sketch
 
 ```rust
-use pg_work_queue::{Worker, Outcome, JobContext, Pusher, BackoffPolicy};
+use pg_work_queue::{Worker, Outcome, JobContext, Pusher, BackoffPolicy, JsonCodec};
 use serde::{Serialize, Deserialize};
 use std::time::Duration;
 
@@ -137,92 +185,165 @@ async fn main() -> anyhow::Result<()> {
         .concurrency(16)
         .max_attempts(5)
         .lease_timeout(Duration::from_secs(300))
+        .reaper_interval(Duration::from_secs(60))
         .retry_backoff(BackoffPolicy::exponential(
-            Duration::from_secs(1),  // base
-            2.0,                      // factor
-            Duration::from_secs(300), // cap
-            0.2,                      // jitter ratio
+            Duration::from_secs(1),     // base
+            2.0,                         // factor
+            Duration::from_secs(300),   // cap
+            0.2,                         // jitter ratio
         ))
-        .done_retention(Duration::from_secs(7 * 24 * 3600))
-        .dead_retention(None) // ∞ — keep forever
         .handler(|task: EmailTask, ctx: JobContext| async move {
-            tracing::info!(to = %task.to, attempt = ctx.attempt, "sending");
-            match send_smtp(&task).await {
+            tracing::info!(
+                job.id = ctx.id,
+                job.attempt = ctx.attempt,
+                idempotency_key = %ctx.idempotency_key,
+                "handling email"
+            );
+            match send_smtp(&task, &ctx.idempotency_key).await {
                 Ok(_) => Outcome::Done,
                 Err(e) if e.is_transient() => Outcome::Retry {
                     reason: e.to_string(),
-                    in_: None, // use policy
+                    in_: None, // backoff from policy
                 },
                 Err(e) => Outcome::Dead { reason: e.to_string() },
             }
         })
         .build()?;
 
-    let handle = worker.start(); // spawns poll loop + reaper + retention sweeper
+    let handle = worker.start(); // spawns poll loop + reaper
 
     // Push side (in your own transaction):
     let mut tx = pool.begin().await?;
-    Pusher::new("email_send")
+    let pusher = Pusher::new("email_send"); // JsonCodec default
+    let public_id: uuid::Uuid = pusher
         .push(&mut tx, &EmailTask { to: "x@y".into(), body: "hi".into() })
         .await?;
     tx.commit().await?;
 
-    // Batch push (perf for outbox-style workloads):
+    // Batch push:
     let mut tx = pool.begin().await?;
-    Pusher::new("email_send")
+    let ids: Vec<uuid::Uuid> = pusher
         .push_batch(&mut tx, &[task1, task2, task3])
         .await?;
     tx.commit().await?;
 
+    // Manual cleanup (user-controlled — call from your scheduler):
+    let purged_done = pg_work_queue::purge_done(&pool, Duration::from_secs(7 * 24 * 3600)).await?;
+    let purged_dead = pg_work_queue::purge_dead(&pool, Duration::from_secs(90 * 24 * 3600)).await?;
+
     // Graceful shutdown:
     tokio::signal::ctrl_c().await?;
-    handle.shutdown(Duration::from_secs(10)).await?;
+    let stats = handle.shutdown(Duration::from_secs(10)).await?;
+    tracing::info!(
+        completed = stats.completed,
+        failed = stats.failed,
+        aborted = stats.aborted,
+        "worker shut down"
+    );
     Ok(())
 }
 ```
 
+### `JobContext` (handler argument)
+
+```rust
+pub struct JobContext {
+    pub id: i64,                       // internal BIGINT PK
+    pub public_id: Uuid,               // = idempotency_key (alias)
+    pub idempotency_key: Uuid,         // stable across retries
+    pub queue: String,                 // queue name (cloned for handler)
+    pub attempt: u32,                  // 1-indexed, current attempt
+    pub first_attempted_at: DateTime<Utc>,
+    pub lease_token: Uuid,             // current claim's fencing token
+}
+```
+
+`idempotency_key` i `public_id` to ta sama wartość (alias dla readability).
+`public_id` ekspozuje implementację (UUID v7 zegarodatowy), `idempotency_key`
+ekspozuje intencję (use this for dedup). Handler używa `idempotency_key`.
+
 ### Builder knobs (każdy z behavioral testem przy 2 wartościach)
 
-| Knob | Default | Effect |
-|---|---|---|
-| `queue(&str)` | required | nazwa queue (PG column lookup) |
-| `poll_interval(Duration)` | 1s | **deterministyczny** cycle (nie backoff) |
-| `concurrency(usize)` | num_cpus | max parallel handlers per worker |
-| `max_attempts(u32)` | 3 | przed dead-letter |
-| `lease_timeout(Duration)` | 5min | po tym czasie stale-running wiersz reapowany |
-| `reaper_interval(Duration)` | 60s | jak często sprawdzać stale-running |
-| `batch_size(usize)` | 10 | ile wierszy claim'ować per poll |
-| `retry_backoff(BackoffPolicy)` | `Exponential { base: 1s, factor: 2, cap: 5min, jitter: 0.2 }` | używany gdy `Outcome::Retry { in_: None }` |
-| `done_retention(Duration)` | 7 days | po tym czasie `done` rows są DELETE'd |
-| `dead_retention(Option<Duration>)` | `None` (∞) | dead rows trzymane forever — diagnostyka |
-| `retention_interval(Duration)` | 1h | jak często sweeper czyści stare rows |
+| Knob | Default | Validation | Effect |
+|---|---|---|---|
+| `queue(&str)` | required | non-empty, ≤ 64 chars | nazwa queue |
+| `poll_interval(Duration)` | 1s | ≥ 10 ms | deterministyczny cycle |
+| `concurrency(usize)` | num_cpus | 1..=pool.size | max parallel handlers |
+| `max_attempts(u32)` | 3 | ≥ 1, ≤ `i32::MAX` | przed dead-letter |
+| `lease_timeout(Duration)` | 5min | ≥ poll_interval × 5 | stale-running threshold |
+| `reaper_interval(Duration)` | lease_timeout/4 | ≥ 1s, ≤ lease_timeout/2 | reaper tick cadence |
+| `batch_size(usize)` | 10 | 1..=1_000 | rows per claim_batch |
+| `retry_backoff(BackoffPolicy)` | `Exponential { 1s, 2.0, 5min, 0.2 }` | jitter ∈ [0,1], cap ≤ 24h | used when `Outcome::Retry { in_: None }` |
+| `panic_policy(PanicPolicy)` | `Retry` | enum: `Retry` \| `Dead` | what to do when handler panics |
+| `codec(impl Codec)` | `JsonCodec` | trait-bound | payload serialization |
 
-Każdy z tych ma **integracyjny test który sprawdza observable behavior
-przy dwóch różnych wartościach** (np. `poll_interval(100ms)` vs
-`poll_interval(500ms)` → różnica latency mierzalna).
+Każdy knob ma **integracyjny test który mierzy observable behavior przy
+2 wartościach** (np. `poll_interval(100ms)` vs `poll_interval(500ms)` →
+różnica latency mierzalna).
+
+## Resource limits (`pgwq::limits` module)
+
+```rust
+pub mod limits {
+    /// Max payload size pushable (DB CHECK enforces same).
+    pub const MAX_PAYLOAD_BYTES: usize = 1 * 1024 * 1024; // 1 MiB
+
+    /// Max items per `Pusher::push_batch` call. Larger batches must chunk.
+    pub const MAX_BATCH_SIZE: usize = 10_000;
+
+    /// Max queue name length (DB CHECK enforces same).
+    pub const MAX_QUEUE_LEN: usize = 64;
+
+    /// Max length of `last_error` text. Library truncates at this; DB CHECK backstops.
+    pub const MAX_LAST_ERROR_LEN: usize = 8 * 1024; // 8 KiB
+
+    /// Minimum poll_interval allowed in builder.
+    pub const MIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// Reaper sweep batch size (rows per tick).
+    pub const REAPER_BATCH_SIZE: usize = 1_000;
+
+    /// Purge function chunk size (rows per `DELETE ... LIMIT N` iteration).
+    pub const PURGE_CHUNK_SIZE: usize = 10_000;
+}
+```
+
+Wszystkie te wartości mają DB-side CHECK lub builder-side validation
+jako defense-in-depth. Testy `tests/resource_limits.rs` weryfikują że:
+- `payload.len() > MAX_PAYLOAD_BYTES` → `PushError::PayloadTooLarge`
+- `batch.len() > MAX_BATCH_SIZE` → `PushError::BatchTooLarge`
+- `poll_interval(< MIN_POLL_INTERVAL)` → `BuildError::PollIntervalTooShort`
+- itd.
 
 ## Schema (DB layout)
 
 Schema **`pgwq`** (krótka, nie `pg_work_queue` bo `pg_` prefix jest
-**reserved przez PG** dla schemy systemowej — Postgres odrzuca
-`CREATE SCHEMA pg_work_queue` z `ERROR: unacceptable schema name`).
-Crate nazywa się `pg_work_queue`; tylko nazwa schemy DB jest `pgwq`.
+reserved przez PG dla schemy systemowej).
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS pgwq;
+
+-- updated_at touch trigger function (namespaced to pgwq, not public).
+CREATE OR REPLACE FUNCTION pgwq.set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$;
 
 CREATE TYPE pgwq.job_status AS ENUM (
     'queued', 'running', 'awaiting_retry', 'done', 'dead'
 );
 
 CREATE TABLE pgwq.jobs (
-    id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    public_id          UUID NOT NULL UNIQUE,
-    queue              TEXT COLLATE "C" NOT NULL,
-    payload            BYTEA NOT NULL,
+    id                 BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    public_id          UUID        NOT NULL DEFAULT uuidv7() UNIQUE,
+    queue              TEXT        COLLATE "C" NOT NULL,
+    payload            BYTEA       NOT NULL,
     status             pgwq.job_status NOT NULL DEFAULT 'queued',
-    attempts           SMALLINT NOT NULL DEFAULT 0,
-    lease_token        UUID,           -- fencing token, NOT NULL gdy status='running'
+    attempts           INTEGER     NOT NULL DEFAULT 0,
+    lease_token        UUID,
     last_error         TEXT,
     last_attempted_at  TIMESTAMPTZ,
     first_attempted_at TIMESTAMPTZ,
@@ -231,8 +352,11 @@ CREATE TABLE pgwq.jobs (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT jobs_queue_nonempty CHECK (length(queue) > 0),
-    CONSTRAINT jobs_attempts_nonneg CHECK (attempts >= 0),
+    CONSTRAINT jobs_queue_nonempty        CHECK (length(queue) > 0),
+    CONSTRAINT jobs_queue_max_len         CHECK (length(queue) <= 64),
+    CONSTRAINT jobs_payload_max_size      CHECK (octet_length(payload) <= 1048576),
+    CONSTRAINT jobs_last_error_max_len    CHECK (last_error IS NULL OR length(last_error) <= 8192),
+    CONSTRAINT jobs_attempts_nonneg       CHECK (attempts >= 0),
     CONSTRAINT jobs_temporal CHECK (
         (first_attempted_at IS NULL OR first_attempted_at >= created_at)
         AND (last_attempted_at IS NULL OR last_attempted_at >= COALESCE(first_attempted_at, created_at))
@@ -244,16 +368,19 @@ CREATE TABLE pgwq.jobs (
         (status = 'queued'
             AND attempts = 0
             AND last_attempted_at IS NULL
+            AND first_attempted_at IS NULL
             AND finished_at IS NULL
             AND lease_token IS NULL)
         OR (status = 'running'
             AND attempts > 0
             AND last_attempted_at IS NOT NULL
+            AND first_attempted_at IS NOT NULL
             AND finished_at IS NULL
             AND lease_token IS NOT NULL)
         OR (status = 'awaiting_retry'
             AND attempts > 0
             AND last_attempted_at IS NOT NULL
+            AND first_attempted_at IS NOT NULL
             AND finished_at IS NULL
             AND lease_token IS NULL)
         OR (status IN ('done', 'dead')
@@ -262,15 +389,16 @@ CREATE TABLE pgwq.jobs (
     )
 );
 
--- Bloat resistance: queue tables są high-churn. fillfactor=80 zostawia
--- 20% wolnego miejsca w blokach na HOT updates; autovacuum agresywniej.
+-- High-churn queue tables bloatują na default settings. fillfactor=80
+-- zostawia 20% wolnego per block → HOT updates in-place; agresywniejszy
+-- autovacuum → dead tuples reclamowane szybciej.
 ALTER TABLE pgwq.jobs SET (
     fillfactor = 80,
     autovacuum_vacuum_scale_factor = 0.05,
     autovacuum_analyze_scale_factor = 0.05
 );
 
--- Hot path: poll claim (queued | awaiting_retry, sortowane po run_at, id).
+-- Poll claim hot path
 CREATE INDEX jobs_claim_idx
     ON pgwq.jobs (queue, run_at, id)
     WHERE status IN ('queued', 'awaiting_retry');
@@ -280,31 +408,31 @@ CREATE INDEX jobs_reap_idx
     ON pgwq.jobs (last_attempted_at)
     WHERE status = 'running';
 
--- Retention sweeper hot path
+-- Purge functions hot path
 CREATE INDEX jobs_terminal_idx
     ON pgwq.jobs (finished_at)
     WHERE status IN ('done', 'dead');
+
+CREATE TRIGGER touch_jobs
+    BEFORE UPDATE ON pgwq.jobs
+    FOR EACH ROW EXECUTE FUNCTION pgwq.set_updated_at();
 ```
 
-Decyzje względem `rust_event_outbox` lessons + research:
-- `BIGINT IDENTITY` internal PK + `public_id UUID` external (compact FK/index,
-  sortable wire format).
-- Named CHECK constraints — defense-in-depth przeciw buggy code; `status`
-  invariants enforce'owane na DB level.
-- `lease_token UUID` — fencing token przeciw double-execution race między
-  reaperem a stary workerem (apalis tego NIE ma — żywy bug).
-- Partial indexes na hot paths (claim, reap, terminal). `WHERE status IN`
-  trzyma indeks mały (terminal rows dominują w długim runtime).
-- `COLLATE "C"` na `queue` (byte-exact `=` lookup).
-- ENUM zamiast CHECK constraint na status (rygorystyczniej; apalis nie ma).
-- Schema namespacing (`pgwq.*`).
-- `run_at` — pozwala scheduled jobs (push z `run_at = now() + 5min`).
-- `payload BYTEA` (nie `JSONB`) — biblioteka nie wnika w format.
-  (JSONB można dodać jako optional feature później jeśli ktoś chce
-  filtrować po payload w SQL.)
-- `fillfactor=80` + agresywny autovacuum — high-churn queue tables
-  bloatują standardowymi defaultami (problem opisany przez Brandura
-  w "Building Robust Systems"). Tani fix dnia zerowego.
+Decyzje:
+- `BIGINT IDENTITY` internal + `public_id UUID` external (uuidv7 default
+  → time-ordered B-tree locality).
+- `attempts INTEGER` (nie SMALLINT) — `u32` API space-fits.
+- `lease_token UUID` — fencing token w mark_* WHERE.
+- `CHECK` na payload/queue/last_error length jako defense-in-depth +
+  library-side truncation przed insert.
+- `first_attempted_at` w status invariants (symmetric z `last_attempted_at`).
+- ENUM `pgwq.job_status` zamiast TEXT+CHECK.
+- `pgwq.set_updated_at` namespace'd, nie w `public`, żeby nie kolidować
+  z user'owym helperem.
+- `touch_jobs` trigger → wszystkie SQL queries w pgwq **NIE** ustawiają
+  explicit `updated_at = now()`. Single source of truth.
+- 3 partial indexes na hot paths.
+- Wymaga **PostgreSQL 18+** (`uuidv7()` natywne; CHECK w `numeric()` itd).
 
 ## Internal architecture
 
@@ -315,38 +443,43 @@ Decyzje względem `rust_event_outbox` lessons + research:
                             └──────────────────┘
                                      │
                             ┌────────▼────────┐
-                            │    pgwq.jobs    │
+                            │   pgwq.jobs     │
                             └────────┬────────┘
                                      │
-            ┌─────────────────┬──────┴───────┬──────────────────┐
-            │                 │              │                  │
-    ┌───────▼────────┐ ┌──────▼───────┐ ┌────▼─────────┐ ┌──────▼─────────┐
-    │  Poll Loop     │ │ Reaper Loop  │ │ Retention    │ │ (handler pool, │
-    │  every N ms    │ │ SKIP LOCKED  │ │ Sweeper      │ │  JoinSet)      │
-    │  CTE + UPDATE  │ │ flip stale   │ │ DELETE       │ │                │
-    │  SKIP LOCKED   │ │ → retry      │ │ done/dead    │ │                │
-    │  RETURNING *   │ │ (no advisory)│ │ > TTL        │ │                │
-    └───────┬────────┘ └──────────────┘ └──────────────┘ └────────────────┘
-            │
-            │ Vec<Job<T>>
-            ▼
-    ┌──────────────────┐
-    │ tokio::JoinSet   │
-    │ spawn handler    │
-    │ per claimed row  │
-    │ (max concurrency)│
-    └─────────┬────────┘
-              │
-              ▼
-     handler return → mark_done(id, lease_token)
-                    / mark_retry(id, lease_token, ...)
-                    / mark_dead(id, lease_token, ...)
+                ┌────────────────────┼────────────────────┐
+                │                    │                    │
+        ┌───────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
+        │  Poll Loop     │  │  Reaper Loop    │  │ (user-invoked   │
+        │  every N ms    │  │  SKIP LOCKED    │  │  purge_done /   │
+        │  CTE+UPDATE    │  │  CASE WHEN      │  │  purge_dead)    │
+        │  SKIP LOCKED   │  │  attempts >=    │  │                 │
+        │  RETURNING *   │  │  max_attempts   │  │                 │
+        └───────┬────────┘  └─────────────────┘  └─────────────────┘
+                │
+                │ Vec<Job<T>>
+                ▼
+        ┌──────────────────┐
+        │ tokio::JoinSet   │
+        │ spawn handler    │
+        │ per claimed row  │
+        │ (max concurrency)│
+        └─────────┬────────┘
+                  │
+                  ▼
+         handler return → mark_done(id, lease_token)
+                        / mark_retry(id, lease_token, ...)
+                        / mark_dead(id, lease_token, ...)
+                        / panic → mark_retry albo mark_dead (per policy)
 ```
+
+**Worker spawn'uje tylko 2 background tasks: poll loop + reaper.**
+Retention sweeper z planu v1 — usunięty. User wywołuje `pgwq::purge_*`
+ręcznie ze swojego cron / scheduler.
 
 ### Poll loop (heart)
 
 ```rust
-async fn poll_loop<T>(state: &WorkerState<T>) {
+async fn poll_loop<T>(state: Arc<WorkerState<T>>) {
     let mut ticker = tokio::time::interval(state.poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -355,20 +488,20 @@ async fn poll_loop<T>(state: &WorkerState<T>) {
             _ = state.shutdown.cancelled() => break,
         }
 
-        // Acquire one permit upfront — gates whole tick.
         let permit = tokio::select! {
             r = state.semaphore.clone().acquire_owned() => r,
             _ = state.shutdown.cancelled() => break,
         };
-        let Ok(permit) = permit else { break }; // semaphore closed
+        let Ok(permit) = permit else { break };
 
-        let batch = claim_batch(&state.pool, &state.queue, state.batch_size).await;
-        match batch {
-            Ok(rows) if rows.is_empty() => {
-                drop(permit);
-                continue;
-            }
+        let span = tracing::info_span!("pgwq.poll_tick",
+            queue = %state.queue, batch_size = state.batch_size);
+        let _enter = span.enter();
+
+        match claim_batch(&state.pool, &state.queue, state.batch_size).await {
+            Ok(rows) if rows.is_empty() => { drop(permit); continue; }
             Ok(rows) => {
+                tracing::info!(claimed = rows.len(), "batch claimed");
                 let mut iter = rows.into_iter();
                 if let Some(row) = iter.next() {
                     state.tasks.spawn(handle_job(row, state.clone(), permit));
@@ -382,6 +515,11 @@ async fn poll_loop<T>(state: &WorkerState<T>) {
                     state.tasks.spawn(handle_job(row, state.clone(), p));
                 }
             }
+            Err(e) if is_fatal_sqlx(&e) => {
+                tracing::error!(error = %e, "fatal DB error in claim_batch; shutting down worker");
+                state.shutdown.cancel();
+                break;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "claim batch failed; will retry next tick");
                 drop(permit);
@@ -390,6 +528,10 @@ async fn poll_loop<T>(state: &WorkerState<T>) {
     }
 }
 ```
+
+`is_fatal_sqlx` distinguishes `PoolClosed` / `WorkerCrashed` / `Migrate`
+(fatal → self-shutdown) od `Database` / `Io` / `Tls` (transient → retry
+next tick).
 
 ### `claim_batch` SQL
 
@@ -408,29 +550,24 @@ SET status = 'running',
     attempts = j.attempts + 1,
     last_attempted_at = now(),
     first_attempted_at = COALESCE(j.first_attempted_at, now()),
-    lease_token = gen_random_uuid(),
-    updated_at = now()
+    lease_token = gen_random_uuid()
 FROM claimed
 WHERE j.id = claimed.id
 RETURNING j.id, j.public_id, j.queue, j.payload, j.attempts,
           j.first_attempted_at, j.lease_token;
 ```
 
-Załatwia:
-- Atomic claim (`FOR UPDATE SKIP LOCKED` — multi-worker safe).
-- Inkrementacja attempts w tej samej query.
-- Scheduled jobs (`run_at <= now()`).
-- Fresh `lease_token` per claim — fencing token w `mark_*` queries.
+(`updated_at` ustawia trigger, nie explicit SET.)
 
-### Reaper (SKIP LOCKED, no advisory lock)
+### Reaper (single-CTE, no race window)
 
-Apalis używa `INNER JOIN apalis.workers` + advisory locki = kompleks i race
-conditions. My idziemy prościej: SKIP LOCKED na stale-running rows.
-N replik **naturalnie** partycjonuje pracę.
+**Plan v1 miał two-step reaper z drugim UPDATE bez status/lease_token
+guard'a — łamał własną regułę #6 (każdy UPDATE w state-machine musi
+mieć dodatkowy guard). v2 łączy w jeden CTE z `CASE WHEN`:**
 
 ```sql
-WITH reaped AS (
-    SELECT id FROM pgwq.jobs
+WITH stale AS (
+    SELECT id, attempts FROM pgwq.jobs
     WHERE status = 'running'
       AND last_attempted_at < now() - $1::interval
     ORDER BY last_attempted_at
@@ -438,444 +575,709 @@ WITH reaped AS (
     FOR UPDATE SKIP LOCKED
 )
 UPDATE pgwq.jobs j
-SET status = 'awaiting_retry',
-    last_error = COALESCE(last_error, 'lease_expired'),
-    lease_token = NULL,
-    updated_at = now()
-FROM reaped
-WHERE j.id = reaped.id
-RETURNING j.id, j.attempts;
+SET status = CASE
+        WHEN s.attempts >= $3 THEN 'dead'::pgwq.job_status
+        ELSE 'awaiting_retry'::pgwq.job_status
+    END,
+    finished_at = CASE
+        WHEN s.attempts >= $3 THEN now()
+        ELSE NULL
+    END,
+    last_error = COALESCE(j.last_error, CASE
+        WHEN s.attempts >= $3 THEN 'lease_expired_max_attempts'
+        ELSE 'lease_expired'
+    END),
+    lease_token = NULL
+FROM stale s
+WHERE j.id = s.id
+RETURNING j.id, j.status, j.attempts;
 ```
 
-Reaper-side decyzja czy flip → `awaiting_retry` czy `dead` (gdy
-`attempts >= max_attempts`) — drugi update w tej samej transakcji
-po zwracanym set:
+Atomic single-statement. SKIP LOCKED w CTE = stale rows trzymane workerem
+nie są reapowane. Brak race window.
 
-```sql
-UPDATE pgwq.jobs
-SET status = 'dead',
-    finished_at = now(),
-    last_error = COALESCE(last_error, 'lease_expired_max_attempts'),
-    updated_at = now()
-WHERE id = ANY($1::bigint[]) AND attempts >= $2;
+Reaper task:
+
+```rust
+async fn reaper_loop(state: Arc<WorkerState>) {
+    let mut ticker = tokio::time::interval(state.reaper_interval);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {},
+            _ = state.shutdown.cancelled() => return,
+        }
+
+        let span = tracing::info_span!("pgwq.reap_tick", queue = %state.queue);
+        let _enter = span.enter();
+
+        match reap(&state.pool, &state.queue, state.lease_timeout,
+                   limits::REAPER_BATCH_SIZE, state.max_attempts).await
+        {
+            Ok(reaped) if reaped.is_empty() => {}
+            Ok(reaped) => {
+                let dead_count = reaped.iter().filter(|r| r.status == "dead").count();
+                let retry_count = reaped.len() - dead_count;
+                tracing::warn!(
+                    reaped_total = reaped.len(),
+                    reaped_dead = dead_count,
+                    reaped_retry = retry_count,
+                    "stale jobs reaped"
+                );
+                for row in &reaped {
+                    if row.status == "dead" {
+                        tracing::error!(
+                            job.id = row.id, job.attempts = row.attempts,
+                            "job dead-lettered (lease expired, max_attempts exhausted)"
+                        );
+                    }
+                }
+            }
+            Err(e) if is_fatal_sqlx(&e) => {
+                tracing::error!(error = %e, "fatal DB error in reaper; shutting down");
+                state.shutdown.cancel();
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reap tick failed; will retry");
+            }
+        }
+    }
+}
 ```
 
-Brak advisory locków → brak leak'u → brak stuck rows.
+Reaper task wrapped w `JoinSet::spawn` z `tracing::error!` na panic via
+`JoinError`.
 
 ### Mark queries (fencing token w WHERE)
 
 ```sql
 -- mark_done
 UPDATE pgwq.jobs
-SET status = 'done',
-    finished_at = now(),
-    last_error = NULL,
-    lease_token = NULL,
-    updated_at = now()
+SET status = 'done', finished_at = now(), last_error = NULL, lease_token = NULL
 WHERE id = $1 AND status = 'running' AND lease_token = $2;
 
--- mark_retry (po Err)
+-- mark_retry
 UPDATE pgwq.jobs
-SET status = 'awaiting_retry',
-    last_error = $3,
-    run_at = $4,  -- now() + backoff(attempts) lub user-supplied in_
-    lease_token = NULL,
-    updated_at = now()
+SET status = 'awaiting_retry', last_error = $3, run_at = $4, lease_token = NULL
 WHERE id = $1 AND status = 'running' AND lease_token = $2;
 
--- mark_dead (Permanent error lub max_attempts exhausted)
+-- mark_dead
 UPDATE pgwq.jobs
-SET status = 'dead',
-    finished_at = now(),
-    last_error = $3,
-    lease_token = NULL,
-    updated_at = now()
+SET status = 'dead', finished_at = now(), last_error = $3, lease_token = NULL
 WHERE id = $1
   AND status IN ('running', 'awaiting_retry')
   AND lease_token = $2;
 ```
 
-Każda zachowuje `WHERE status = ... AND lease_token = $2`. Stary worker
-który próbuje mark_done po reaperze nie znajdzie row'a (lease_token się
-nie zgadza) → 0 rows affected → handler się dowiaduje, loguje warning,
-nie commituje side-effect. Apalis ma tylko status guard, nie ma fencing
-token → race window jest realny.
+**0-rows-affected reactions** (explicit):
 
-### Retention sweeper
+- `mark_done` 0 rows → reaper już flipnął (lease expired) lub szczególny
+  race. Log `warn!(job.id, idempotency_key, "mark_done lost race — side-effect
+  may have already been retried by other worker")`. Worker continues —
+  next claim picks up.
+- `mark_retry` 0 rows → analogously. `warn!`. Continue.
+- `mark_dead` 0 rows → analogously. `warn!`. Continue.
 
-Osobny tokio task, interval = `retention_interval` (default 1h):
+W żadnym wypadku worker NIE re-attempts; reaper-spawned retry przejmuje
+dalszą logikę.
 
-```sql
--- Done — krótszy TTL (default 7d), to noise.
-DELETE FROM pgwq.jobs
-WHERE status = 'done' AND finished_at < now() - $1::interval;
+### Manual cleanup — `pgwq::purge_*`
 
--- Dead — opcjonalny TTL (default ∞), to diagnostic gold.
-DELETE FROM pgwq.jobs
-WHERE status = 'dead' AND finished_at < now() - $2::interval;
+User wywołuje gdy chce (cron, scheduled task, manual operations).
+Chunked DELETE, SKIP LOCKED na wszelki wypadek:
+
+```rust
+/// Delete `done` rows older than `age`. Returns count deleted.
+pub async fn purge_done(pool: &sqlx::PgPool, age: Duration) -> Result<u64, PurgeError>;
+
+/// Delete `dead` rows older than `age`. Returns count deleted.
+pub async fn purge_dead(pool: &sqlx::PgPool, age: Duration) -> Result<u64, PurgeError>;
 ```
 
-Drugie query odpalane tylko gdy `dead_retention` != None.
+SQL (per function):
 
-### Batch push (perf — outbox use case)
+```sql
+WITH victims AS (
+    SELECT id FROM pgwq.jobs
+    WHERE status = $1::pgwq.job_status
+      AND finished_at < now() - $2::interval
+    ORDER BY finished_at
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM pgwq.jobs WHERE id IN (SELECT id FROM victims);
+```
+
+Funkcja w pętli z `LIMIT limits::PURGE_CHUNK_SIZE` aż batch zwróci 0
+(no more matches). Sumuje deleted count.
+
+Tracing:
+```rust
+tracing::info!(status = %status, age = ?age, deleted = total, "purge complete");
+```
+
+### Batch push
 
 ```sql
 INSERT INTO pgwq.jobs (queue, payload, public_id, run_at)
-SELECT $1, unnest($2::bytea[]), unnest($3::uuid[]), unnest($4::timestamptz[])
+SELECT $1, unnest($2::bytea[]), unnest($3::uuid[]),
+       COALESCE(unnest($4::timestamptz[]), now())
+ORDER BY ordinality
 RETURNING id, public_id;
 ```
 
-Lub dla bardzo dużych batches → `COPY FROM STDIN` przez sqlx
-`copy_in_raw`. API:
+`Pusher` client-side:
+1. Validate `items.len() <= limits::MAX_BATCH_SIZE` → else `PushError::BatchTooLarge`.
+2. Generate `public_id = Uuid::now_v7()` per item (deterministic ordering;
+   client-side dla outbox correlation-in-same-tx).
+3. Validate `payload.len() <= limits::MAX_PAYLOAD_BYTES` per item → else
+   `PushError::PayloadTooLarge { index, size }`.
+4. Single `INSERT...SELECT unnest()` round-trip.
+
+Return: `Vec<Uuid>` w **input order** (zachowane przez `ORDER BY ordinality`).
+
+API:
 
 ```rust
-impl Pusher {
+pub struct Pusher<C = JsonCodec> {
+    queue: String,
+    codec: C,
+}
+
+impl Pusher<JsonCodec> {
+    pub fn new(queue: impl Into<String>) -> Self;
+}
+
+impl<C: Codec> Pusher<C> {
+    pub fn with_codec<C2: Codec>(self, codec: C2) -> Pusher<C2>;
+
+    pub async fn push<T: Serialize>(
+        &self, tx: &mut PgConnection, payload: &T,
+    ) -> Result<Uuid, PushError>;
+
+    pub async fn push_at<T: Serialize>(
+        &self, tx: &mut PgConnection, payload: &T, run_at: DateTime<Utc>,
+    ) -> Result<Uuid, PushError>;
+
     pub async fn push_batch<T: Serialize>(
-        &self,
-        tx: &mut PgConnection,
-        items: &[T],
+        &self, tx: &mut PgConnection, payloads: &[T],
     ) -> Result<Vec<Uuid>, PushError>;
 }
 ```
 
-Apalis ma `unnest($1::text[],...)` pattern w `sink.sql` — kopiujemy
-i dodajemy opcjonalne `ON CONFLICT DO NOTHING` (gdy user supplyuje
-external idempotency key — TBD jako follow-up feature).
+### Codec
+
+```rust
+pub trait Codec: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn encode<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, Self::Error>;
+    fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, Self::Error>;
+}
+
+pub struct JsonCodec;
+
+impl Codec for JsonCodec {
+    type Error = serde_json::Error;
+    fn encode<T: Serialize>(&self, v: &T) -> Result<Vec<u8>, _> { serde_json::to_vec(v) }
+    fn decode<T: DeserializeOwned>(&self, b: &[u8]) -> Result<T, _> { serde_json::from_slice(b) }
+}
+```
+
+Default `JsonCodec`. User implementuje swój `Codec` jeśli chce CBOR /
+bincode / etc. `serde_json` dodajemy do deps.
 
 ## Retry backoff policy
 
 ```rust
 pub enum BackoffPolicy {
-    Fixed(Duration),
-    Linear { base: Duration, increment: Duration, cap: Duration },
+    Linear {
+        base: Duration,
+        increment: Duration,
+        cap: Duration,
+    },
     Exponential {
         base: Duration,
-        factor: f64,
+        factor: f64,    // > 1.0
         cap: Duration,
-        jitter: f64,  // ratio 0.0..=1.0
+        jitter: f64,    // ratio 0.0..=1.0
     },
 }
 
 impl BackoffPolicy {
-    pub fn next(&self, attempt: u32) -> Duration { /* ... */ }
+    pub fn exponential(base: Duration, factor: f64, cap: Duration, jitter: f64) -> Self;
+    pub fn fixed(d: Duration) -> Self;   // → Linear { base: d, inc: 0, cap: d }
+    pub fn next(&self, attempt: u32) -> Duration;
 }
 ```
 
-Plan v0 mówił "domyślnie 0 (next poll cycle)". To footgun — flapping
-handler spali `max_attempts` w jednej sekundzie. Default v1:
-`Exponential { base: 1s, factor: 2.0, cap: 5min, jitter: 0.2 }`. Daje
-sequence ~1s, 2s, 4s, 8s, ... 5min (z ±20% jitter).
+`Fixed` variant usunięty (degenerate Linear). `fixed()` constructor
+zachowany dla convenience.
 
-User może override per-call w `Outcome::Retry { in_: Some(d) }`. Jitter
-ważny przy thundering herd (10 jobs fails równocześnie → bez jittera
+Default: `Exponential { 1s, 2.0, 5min, 0.2 }` → ~1s, 2s, 4s, 8s, ... 5min
+(±20% jitter).
+
+Jitter ważny przy thundering herd (10 jobs fails równocześnie → bez jittera
 wszystkie wracają w tym samym ticku).
+
+User per-call override: `Outcome::Retry { in_: Some(d), .. }`.
+**Cap**: `d` clamp'owany do `[Duration::ZERO, 24h]` żeby nie przyjmować
+`Duration::MAX` jako footgun.
+
+## Error semantics & handling
+
+### Public error enums
+
+```rust
+#[derive(thiserror::Error, Debug)]
+pub enum PushError {
+    #[error("payload too large: {size} bytes > {max}")]
+    PayloadTooLarge { index: usize, size: usize, max: usize },
+    #[error("batch too large: {size} > {max}")]
+    BatchTooLarge { size: usize, max: usize },
+    #[error("queue name invalid: {0}")]
+    QueueNameInvalid(String),
+    #[error("codec error: {0}")]
+    Codec(#[source] BoxError),
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum BuildError {
+    #[error("poll_interval must be >= {min:?}")]
+    PollIntervalTooShort { min: Duration },
+    #[error("concurrency must be >= 1")]
+    ConcurrencyZero,
+    #[error("max_attempts must be >= 1")]
+    MaxAttemptsZero,
+    #[error("lease_timeout must be >= 5 * poll_interval")]
+    LeaseTimeoutTooShort,
+    #[error("reaper_interval must be <= lease_timeout / 2")]
+    ReaperIntervalTooLong,
+    #[error("queue name invalid: {0}")]
+    QueueNameInvalid(String),
+    #[error("handler not set")]
+    HandlerMissing,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ShutdownError {
+    #[error("worker already shut down")]
+    AlreadyShutdown,
+    #[error("worker failed with fatal error: {0}")]
+    Fatal(sqlx::Error),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum PurgeError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}
+```
+
+### Handler outcome semantics
+
+```rust
+pub enum Outcome {
+    Done,
+    Retry { reason: String, in_: Option<Duration> },
+    Dead { reason: String },
+}
+```
+
+Library applies:
+- `Done` → `mark_done` (fencing-guarded).
+- `Retry` → `mark_retry` z `run_at = now() + in_.unwrap_or_else(|| backoff.next(attempts))`.
+  Jeśli `attempts >= max_attempts` → upgrade do `mark_dead`.
+- `Dead` → `mark_dead` natychmiast (bypass attempts check).
+- **Panic** → per `PanicPolicy`:
+  - `PanicPolicy::Retry` (default) → `mark_retry` z `reason = "panic: <msg>"`.
+  - `PanicPolicy::Dead` → `mark_dead` z `reason = "panic: <msg>"`.
+- **Codec decode error** (worker can't deserialize payload) → `mark_dead`
+  natychmiast z `reason = "payload decode: <err>"`. NIE wywołuje handler.
+  Każdy retry attempt by ten sam decode-error miał → terminal natychmiast.
+
+### Library-side string truncation
+
+Wszystkie user-supplied `reason` strings (Outcome::Retry/Dead, panic
+message) **truncate'owane na library boundary** do `limits::MAX_LAST_ERROR_LEN`
+zanim go do `last_error`. Trim by char boundary safe (rust-safe-string-truncation
+skill). DB CHECK na 8 KiB jako backstop.
+
+Także `tracing::warn!(reason = %trim(reason))` — nie logujemy nieograniczonych
+user strings.
+
+### Sqlx error classification
+
+```rust
+fn is_fatal_sqlx(e: &sqlx::Error) -> bool {
+    matches!(e,
+        sqlx::Error::PoolClosed
+        | sqlx::Error::WorkerCrashed
+        | sqlx::Error::Configuration(_)
+        | sqlx::Error::Migrate(_)
+    )
+}
+```
+
+Fatal → worker self-shutdown via cancellation token. Transient
+(Database / Io / Tls / Protocol) → warn + retry next tick.
+
+## Observability spec
+
+Tracing-first observability. Każda critical operacja ma:
+- **Span** wokół całej operacji z `name` i podstawowymi attrs.
+- **Event** na każde state-machine transition.
+- **Worker identity attribute** dla multi-replica debugging.
+
+### Span vocabulary
+
+| Span name | When | Attrs |
+|---|---|---|
+| `pgwq.poll_tick` | każdy poll cycle | `worker.id`, `queue`, `batch_size`, `claimed` (after) |
+| `pgwq.claim_batch` | claim SQL query | `worker.id`, `queue`, `batch_size`, `rows_returned`, `duration_ms` |
+| `pgwq.handle_job` | per handler invocation | `worker.id`, `queue`, `job.id`, `job.public_id`, `job.attempt` |
+| `pgwq.mark_done` | mark_done SQL | `worker.id`, `job.id`, `rows_affected` |
+| `pgwq.mark_retry` | mark_retry SQL | `worker.id`, `job.id`, `job.attempt`, `retry_in_ms`, `rows_affected` |
+| `pgwq.mark_dead` | mark_dead SQL | `worker.id`, `job.id`, `job.attempts`, `rows_affected` |
+| `pgwq.reap_tick` | reaper cycle | `worker.id`, `queue`, `reaped_total`, `reaped_dead`, `reaped_retry` |
+| `pgwq.push` | Pusher::push | `queue`, `public_id`, `payload_size` |
+| `pgwq.push_batch` | Pusher::push_batch | `queue`, `count`, `total_payload_size` |
+| `pgwq.purge` | purge_done / purge_dead | `status`, `age`, `deleted` |
+| `pgwq.shutdown` | WorkerHandle::shutdown | `worker.id`, `timeout_ms`, `completed`, `failed`, `aborted` |
+
+### State transition events
+
+Każde state transition emituje `tracing::info!` (lub `tracing::error!`
+dla dead-letter) event z structured attrs:
+
+```rust
+tracing::info!(
+    job.id = id,
+    job.public_id = %public_id,
+    queue = %queue,
+    status.from = "running",
+    status.to = "done",
+    "pgwq.state.transition"
+);
+```
+
+Tabela:
+
+| From → To | Level | When |
+|---|---|---|
+| → `queued` | `info` | push, push_batch (1 event per row inserted) |
+| `queued` → `running` | `debug` | claim_batch (1 event per row claimed) |
+| `awaiting_retry` → `running` | `debug` | claim_batch (re-attempt) |
+| `running` → `done` | `info` | mark_done success |
+| `running` → `awaiting_retry` | `info` | mark_retry success (handler retry or reaper) |
+| `running` → `dead` | **`error`** | mark_dead (max_attempts exhausted) — **dead-letter** |
+| `dead`/`done` → ∅ | `info` | purge_done / purge_dead delete |
+
+### Worker identity
+
+Każdy `Worker::start()` przypisuje `worker.id = Uuid::now_v7()` używany
+jako `worker.id` attribute w każdym span/event. Pozwala multi-replica
+debug: "który replikator claim'ował job X?".
+
+### OpenTelemetry compatibility
+
+Span names i attrs zgodne z OpenTelemetry messaging semantic conventions
+gdzie pasują:
+- `messaging.system` = `"pg_work_queue"`
+- `messaging.destination.name` = queue name
+- `messaging.operation` = `"send"` (push) / `"receive"` (claim) / `"process"` (handle)
+- `messaging.message.id` = public_id
+
+User z `tracing-opentelemetry` integracją dostaje OTel metrics/traces
+out-of-the-box.
+
+### Tracing initialization w testach
+
+`tests/common/mod.rs` zawiera `init_tracing()` helper z env-filter
+`RUST_LOG=pgwq=debug,test=info` (default). Każdy test file `mod.rs` calls
+go w `#[tokio::test]` setup.
 
 ## Shutdown semantics
 
 `WorkerHandle::shutdown(timeout: Duration) -> Result<Stats, ShutdownError>`:
 
-1. Cancel `state.shutdown` token → wszystkie pętle (poll, reaper,
-   retention) wychodzą natychmiast z tokio::select.
-2. Drop semaphore permits acquire — nowe handler'y się nie spawn'ują.
-3. Czekaj na `JoinSet::join_next` w pętli z `timeout`.
-4. Po timeout: abort wszystkich pozostałych tasks, return Stats z
-   `aborted_count`, `completed_count`, `failed_count`.
+1. Cancel `shutdown` cancellation token → poll loop + reaper exit
+   immediately (na `tokio::select` z token).
+2. Drop semaphore permit-acquire — nowe handlery się nie spawn'ują.
+3. `JoinSet::join_next` w pętli z `tokio::time::timeout(timeout)`.
+4. Po timeout: `JoinSet::abort_all()`, czekaj na ostatnie join. Stats
+   summary.
 
-Aborted handlers nie wywołują `mark_done`/`mark_retry` → ich rows
-zostają `status='running'` z aktualnym `lease_token`. Reaper zauważy
-po `lease_timeout` i flipnie → `awaiting_retry`. Czyli graceful
-shutdown po timeout zachowuje correctness, kosztem opóźnionego retry.
+```rust
+pub struct Stats {
+    pub completed: u64,    // handlers returned Outcome::Done (mark_done ack'd)
+    pub failed: u64,       // handlers returned Outcome::Retry/Dead OR panicked
+    pub aborted: u64,      // handlers aborted via JoinSet::abort_all (timeout)
+}
+```
 
-Bez duplikacji apalis Monitor — jedna metoda, jeden token, pełna
-kontrola.
+**Aborted handlers semantics:** ich rows zostają `status='running'` z
+aktualnym `lease_token`. Reaper-side recovery (po `lease_timeout`) flipuje
+do `awaiting_retry` lub `dead` (na bazie attempts). Czyli **graceful
+shutdown po timeout zachowuje correctness, kosztem opóźnionego retry
+(do `lease_timeout`)**.
 
-## Test strategy (TDD-first od początku)
+**Edge case:** handler `mark_done` w-locie podczas `abort_all`. Jeśli
+SQL UPDATE committed server-side ale tokio future cancelled przed
+zwrotem do worker'a: row jest `done`, handler nie zliczany do completed.
+Stats może być off by 1-2. To fundamentalny limit non-cooperative abort.
+**Dokumentowane jako accepted.**
 
-### Behavioral tests (critical — żaden knob nie kompiluje bez)
+## Test strategy (TDD-first, każdy case testcontainers)
 
-Każdy public knob ma test który mierzy **observable behavior** przy
-dwóch różnych wartościach, asercja na różnicę:
+**Wszystkie behavioral testy używają `testcontainers` PG18.** Każdy
+test spawn'uje swój własny pool, applikuje migracje, runs scenariusz,
+cleanup container. Test parallel-safe (każdy test = osobny container
+albo osobny schema w shared container — TBD per fixture cost).
 
-1. **`tests/poll_interval_behavior.rs`** — dispatch + measure pickup
-   latency z `poll_interval(100ms)` vs `poll_interval(500ms)`. Average
-   latency dla pierwszego < 200ms, dla drugiego ≥ 250ms i ≤ 700ms.
-2. **`tests/concurrency_behavior.rs`** — `concurrency(1)` powoduje że
-   N tasków idą sekwencyjnie, `concurrency(N)` że wykonują się
-   parallel.
-3. **`tests/max_attempts_behavior.rs`** — handler zawsze fail Retry.
-   Po `max_attempts(3)` row jest `dead`, po `max_attempts(5)` row
-   jest `dead` po 5 próbach.
-4. **`tests/lease_timeout_behavior.rs`** — symulacja crashed worker
-   (manual UPDATE status='running' z stale last_attempted_at), reaper
-   z `lease_timeout(1s)` flipuje wcześniej niż z `lease_timeout(10s)`.
-5. **`tests/batch_size_behavior.rs`** — push 100 jobs, `batch_size(10)`
-   vs `batch_size(50)` daje różny shape claim batches.
-6. **`tests/scheduled_run_at.rs`** — push z `run_at = now() + 2s`,
-   worker nie pickupuje przed t+2s.
-7. **`tests/retry_backoff_behavior.rs`** — handler zawsze fail z
-   `Outcome::Retry { in_: None }`. Policy `Fixed(1s)` → kolejne
-   `run_at` różnią się ~1s. Policy `Exponential { base: 100ms, factor:
-   2.0, ... }` → kolejne `run_at` rosną geometrycznie. Jitter ±20%
-   testowany przez 50 prób + assert że standard deviation > 0.
-8. **`tests/retry_in_override.rs`** — handler zwraca `Outcome::Retry
-   { in_: Some(5s) }`. Niezależnie od policy, `run_at` = ~now + 5s.
-9. **`tests/done_retention_behavior.rs`** — `done_retention(1s)`:
-   done rows znikają po 1s + interval. `done_retention(1h)`: trzymane
-   dłużej.
-10. **`tests/dead_retention_forever.rs`** — `dead_retention(None)`:
-    dead rows trwają przez kilka sweep cycles. Z `dead_retention(Some(1s))`
-    znikają.
+`tests/common/mod.rs` zawiera:
+- `init_tracing()` — env-filter setup
+- `pg18_pool()` → `(PgPool, testcontainers::Container<Postgres>)` —
+  spawn + migrate
+- helper assertions: `assert_job_status`, `assert_job_attempts`, etc.
 
-### Crash safety / correctness tests
+### Behavioral tests (każdy knob, 2 wartości)
 
-11. **`tests/skip_locked_no_double_claim.rs`** — 2 workery równolegle
-    pollują, push 100 jobs, suma claimed == 100 (no double-claim).
-12. **`tests/stale_running_reaped.rs`** — analog do
-    `rust_event_outbox::stale_running_reaper.rs`.
-13. **`tests/fencing_token_no_double_run.rs`** — claim job → ręcznie
-    flipuje `last_attempted_at` w przeszłość → reaper flipuje status
-    + zeruje lease_token → stary handler kończy się i próbuje
-    `mark_done` ze starym tokenem → 0 rows affected. Row pozostaje
-    `awaiting_retry` (nie skacze do done).
-14. **`tests/shutdown_graceful.rs`** — `shutdown(5s)` czeka na drain;
-    jeśli handler trwa > 5s, abort'owany; stats poprawne.
-15. **`tests/shutdown_cancels_poll_loop.rs`** — mid-poll-sleep
-    shutdown wychodzi natychmiast.
-16. **`tests/migrator_schema.rs`** — schema CREATE'd correctly,
-    indexes obecne, CHECK constraints fire na invalid input
-    (try INSERT z `status='running'` bez `lease_token` → reject),
-    `fillfactor` ustawione (sprawdzić w `pg_class.reloptions`).
-17. **`tests/reaper_no_advisory_lock_leak.rs`** — uruchom 3 reapery
-    równolegle, push 100 stale-running rows, suma reaped == 100,
-    żaden nie został z dwóch reaperów jednocześnie (SKIP LOCKED
-    behavior). Po teście `pg_locks` nie ma session locks z naszych
-    connection ids.
-18. **`tests/batch_push_throughput.rs`** — push 1000 jobs jako
-    single batch vs 1000 single push. Batch musi być wyraźnie
-    szybszy (≥ 5x).
+1. `tests/poll_interval_behavior.rs` — pickup latency 100ms vs 500ms.
+2. `tests/concurrency_behavior.rs` — N=1 sequential vs N>1 parallel.
+3. `tests/max_attempts_behavior.rs` — fail loop, dead po N attempts.
+4. `tests/lease_timeout_behavior.rs` — reaper z 1s vs 10s.
+5. `tests/reaper_interval_behavior.rs` — reaper z 1s vs 5s tick.
+6. `tests/batch_size_behavior.rs` — claim shape przy 10 vs 50.
+7. `tests/scheduled_run_at.rs` — push z run_at = now()+2s.
+8. `tests/retry_backoff_behavior.rs` — Fixed vs Exponential run_at delta.
+9. `tests/retry_in_override.rs` — Outcome::Retry { in_: Some(5s) }.
+10. `tests/panic_policy_behavior.rs` — PanicPolicy::Retry vs ::Dead.
+11. `tests/codec_swappable.rs` — JsonCodec vs custom CborCodec.
 
-### No-DB / unit tests
+### Crash safety / correctness
 
-19. **`tests/builder_validation.rs`** — config validation
-    (`poll_interval == 0` rejected, `concurrency == 0` rejected, etc.)
-20. **`tests/payload_codec.rs`** — round-trip serde + bytea.
-21. **`tests/backoff_policy_unit.rs`** — `BackoffPolicy::next(attempt)`
-    dla każdej wariantu — pure-fn testy bez DB.
+12. `tests/skip_locked_no_double_claim.rs` — 2 workery, 100 jobs, suma = 100.
+13. `tests/stale_running_reaped.rs` — manual UPDATE stale, reaper flipuje.
+14. `tests/reaper_to_dead_when_max_attempts.rs` — reaper z attempts=N+1
+    flipuje do dead (nie awaiting_retry).
+15. `tests/reaper_single_cte_no_race.rs` — verify że single-CTE reaper
+    nie produkuje (running, awaiting_retry, dead) inconsistencies pod
+    concurrent claim+reap (regresja po W1 z review).
+16. `tests/fencing_token_no_double_run.rs` — claim → manual stale → reaper
+    → stary handler mark_done ze starym tokenem → 0 rows.
+17. `tests/shutdown_graceful.rs` — handler trwa krócej niż timeout, drain OK.
+18. `tests/shutdown_abort_after_timeout.rs` — handler trwa dłużej, abort +
+    reaper recovery + correctness.
+19. `tests/shutdown_cancels_poll_loop.rs` — mid-poll-sleep shutdown
+    wychodzi natychmiast.
+20. `tests/migrator_schema.rs` — schema CREATE'd, CHECKs fire, fillfactor
+    w `pg_class.reloptions`.
+21. `tests/reaper_no_advisory_lock_leak.rs` — 3 reapery parallel,
+    `pg_locks` clean post-test.
+22. `tests/fatal_sqlx_triggers_shutdown.rs` — PgPool close mid-poll,
+    worker self-shutdown z error w stats.
 
-### Anti-pattern guard
+### Resource limits
 
-Nie dodawać testów które testują **identyczność struktury**
-(np. `assert_eq!(builder.build().poll_interval, Duration::from_millis(500))`).
-Każdy test musi mierzyć **behavior** widoczny w DB lub przez observable
-side-effect.
+23. `tests/resource_limits.rs` — payload > 1MiB rejected, batch > 10k
+    rejected, last_error truncate, queue name length CHECK.
+24. `tests/builder_validation.rs` — wszystkie `BuildError::*` variants
+    rzucane na nieprawidłowy config.
+
+### Idempotency / at-least-once
+
+25. `tests/idempotency_key_stable_across_retries.rs` — handler fail 3x,
+    captured `ctx.idempotency_key` identical każdy attempt.
+26. `tests/at_least_once_semantics.rs` — simulate mark_done loss
+    (manual rollback), reaper recover, handler called 2x ten sam job
+    z tym samym idempotency_key.
+
+### Push & purge
+
+27. `tests/push_batch_throughput.rs` — 1000 single push vs batch,
+    batch ≥ 5x szybszy.
+28. `tests/push_batch_order_preserved.rs` — push_batch zwraca uuidy
+    w input order.
+29. `tests/purge_done_chunked.rs` — 50k done rows, purge_done(0s)
+    deletuje wszystkie chunkami.
+30. `tests/purge_dead_separate.rs` — purge_done nie tyka dead, vice versa.
+
+### Observability
+
+31. `tests/tracing_events_emitted.rs` — capture tracing events via
+    custom subscriber, assert że dla każdej transition emitted event
+    z expected attrs (job.id, status.from, status.to).
+32. `tests/dead_letter_logged.rs` — job hits max_attempts → reaper or
+    handler emits `tracing::error!` z dead-letter context.
+
+### No-DB / unit
+
+33. `tests/backoff_policy_unit.rs` — `BackoffPolicy::next(attempt)`.
+34. `tests/codec_json_roundtrip.rs` — Serialize → Vec<u8> → Deserialize.
+35. `tests/sqlx_error_classification.rs` — `is_fatal_sqlx` cases.
+36. `tests/truncate_safe_string.rs` — UTF-8 boundary safety w trim.
+
+### Anti-pattern guard (rule, nie test)
+
+Każdy test musi mierzyć **observable behavior** widoczny w DB lub przez
+tracing-subscriber capture. Test który asserts na shape config (np.
+`assert_eq!(builder.poll_interval, 500ms)`) jest **PR-blocker**.
 
 ## Implementation phases
 
-### Faza 0 — repo init
+### Faza 0 — repo init ✅ DONE
+Skeleton, Cargo.toml z pinned deps, initial migration verified na PG18.
+Commit `d9c4dc7`.
 
-- `cargo init --lib` w `pg_work_queue/`.
-- `Cargo.toml`: `sqlx 0.8` (postgres, runtime-tokio-rustls, uuid,
-  chrono, json, macros, migrate), `tokio` (full), `tracing`, `serde`,
-  `thiserror`, `async-trait`, `chrono`, `uuid` (v4 + v7 + serde),
-  `anyhow`, `rand` (jitter), `tokio-util` (sync feature dla
-  `CancellationToken`).
-- Dev: `testcontainers`, `testcontainers-modules` (postgres),
-  `tracing-subscriber`.
-- `migrations/20260513000000_v01_init.sql` z schemą wyżej.
-- Skeleton `lib.rs`: `pub mod migrator; pub mod worker; pub mod
-  pusher; pub mod codec; pub mod backoff;`.
+### Faza 1 — Pusher + codec + migrator
 
-### Faza 1 — push + migracja + manual claim (no worker yet)
+- `Codec` trait + `JsonCodec` impl.
+- `Pusher::new`, `with_codec`, `push`, `push_at`, `push_batch`.
+- `pg_work_queue::migrator()` re-export `sqlx::migrate!("./migrations")`.
+- Resource validation (payload size, batch size, queue length).
+- `PushError` enum.
+- Tests: `migrator_schema.rs`, `push_batch_throughput.rs`,
+  `push_batch_order_preserved.rs`, `resource_limits.rs` (push parts).
 
-- `Pusher::push<T: Serialize>(tx, payload, run_at)` → INSERT.
-- `Pusher::push_batch<T>(tx, &[T])` — unnest variant.
-- `pg_work_queue::migrator()` re-export sqlx::Migrator.
-- Test: `migrator_schema.rs`, `batch_push_throughput.rs`.
+### Faza 2 — claim_batch SQL + Job<T> + JobContext
 
-### Faza 2 — claim_batch SQL + Job/JobContext types
-
-- `claim_batch(pool, queue, batch_size, now)` → `Vec<JobRow>`.
-- `pub struct Job<T>` + `pub struct JobContext { attempt, lease_token, ... }`.
-- Codec generic.
-- Test: `skip_locked_no_double_claim.rs`.
+- `claim_batch` SQL function.
+- `pub struct Job<T>` + `pub struct JobContext`.
+- Codec decode na claim time; decode error → mark_dead.
+- Tests: `skip_locked_no_double_claim.rs`.
 
 ### Faza 3 — single-shot worker + mark queries z fencing
 
-- `Worker::tick_once(...)` — fetches batch, runs handlers sekwencyjnie,
-  `mark_done`/`mark_retry`/`mark_dead` z `lease_token`.
-- Test: end-to-end smoke.
+- `Worker::tick_once(...)` — fetch batch, run handlers sequential,
+  mark_done/retry/dead z fencing.
+- Library-side string truncation w `last_error`.
+- `unreachable_pub` guards.
+- Tests: end-to-end smoke, `fencing_token_no_double_run.rs`.
 
-### Faza 4 — poll loop + concurrency
+### Faza 4 — poll loop + concurrency + worker identity
 
 - `Worker::start()` → spawn poll loop + JoinSet.
-- `CancellationToken` shutdown plumbing.
-- Test: `poll_interval_behavior.rs`, `concurrency_behavior.rs`.
+- `worker.id = Uuid::now_v7()` w span attrs.
+- `CancellationToken` plumbing.
+- `is_fatal_sqlx()` classification.
+- Tracing spans: `pgwq.poll_tick`, `.claim_batch`, `.handle_job`,
+  `.mark_*`. State transition events.
+- Tests: `poll_interval_behavior.rs`, `concurrency_behavior.rs`,
+  `tracing_events_emitted.rs`.
 
-### Faza 5 — reaper (SKIP LOCKED)
+### Faza 5 — reaper (single-CTE, SKIP LOCKED)
 
-- Spawned alongside poll loop, **no advisory lock**.
-- Reaper-side check `attempts >= max_attempts` → flip do `dead` zamiast
-  `awaiting_retry`.
-- Test: `stale_running_reaped.rs`, `lease_timeout_behavior.rs`,
-  `reaper_no_advisory_lock_leak.rs`.
+- Reaper task spawn'ed parallel z poll loop.
+- Single-CTE z CASE WHEN attempts >= max_attempts.
+- `tracing::warn!` na reaped count, `tracing::error!` na dead-letter.
+- Reaper task wrapped w panic-recovery (`JoinSet` + on-panic restart? TBD).
+- Tests: `stale_running_reaped.rs`, `reaper_to_dead_when_max_attempts.rs`,
+  `reaper_single_cte_no_race.rs`, `reaper_no_advisory_lock_leak.rs`,
+  `lease_timeout_behavior.rs`, `reaper_interval_behavior.rs`,
+  `dead_letter_logged.rs`.
 
-### Faza 6 — retry semantics + BackoffPolicy
+### Faza 6 — retry semantics + BackoffPolicy + panic policy
 
-- `Outcome::Retry { in_: Option<Duration> }` z fallback do policy.
-- `BackoffPolicy::{Fixed, Linear, Exponential}` z jitter.
-- `mark_retry` ustawia `run_at = now() + backoff_or_override`.
-- Test: `max_attempts_behavior.rs`, `scheduled_run_at.rs`,
+- `Outcome::Retry { reason, in_ }` z fallback do policy + clamp `in_`.
+- `BackoffPolicy::{Linear, Exponential}` z jitter.
+- `mark_retry` ustawia `run_at = now() + duration`.
+- `Outcome::Dead` → mark_dead direct.
+- `PanicPolicy::{Retry, Dead}` + JoinError::is_panic handling.
+- Tests: `max_attempts_behavior.rs`, `scheduled_run_at.rs`,
   `retry_backoff_behavior.rs`, `retry_in_override.rs`,
-  `backoff_policy_unit.rs`.
+  `panic_policy_behavior.rs`, `backoff_policy_unit.rs`.
 
 ### Faza 7 — shutdown semantics
 
 - `WorkerHandle::shutdown(timeout)`.
-- Test: `shutdown_graceful.rs`, `shutdown_cancels_poll_loop.rs`,
-  `fencing_token_no_double_run.rs`.
+- Stats { completed, failed, aborted }.
+- `pgwq.shutdown` span.
+- Tests: `shutdown_graceful.rs`, `shutdown_abort_after_timeout.rs`,
+  `shutdown_cancels_poll_loop.rs`, `fatal_sqlx_triggers_shutdown.rs`.
 
-### Faza 8 — retention sweeper
+### Faza 8 — manual purge functions
 
-- Osobny tokio task: `done_retention`, `dead_retention`,
-  `retention_interval`.
-- Test: `done_retention_behavior.rs`, `dead_retention_forever.rs`.
+- `pgwq::purge_done(pool, age) -> u64`.
+- `pgwq::purge_dead(pool, age) -> u64`.
+- Chunked with `LIMIT limits::PURGE_CHUNK_SIZE` per iteration.
+- `tracing::info!` na deleted count.
+- Tests: `purge_done_chunked.rs`, `purge_dead_separate.rs`.
 
-### Faza 9 — docs + README
+### Faza 9 — docs + README + idempotency_key contract
 
-- README z quick start.
-- Doc comments na każdym public knob z "observable effect"
-  wzmianką + link do testu.
-- Cargo.toml `description`, `repository`, `documentation`,
-  `categories`, `keywords`.
-- Możliwe: tag `v0.1.0`. Crates.io publish: TBD.
+- README z quick start + at-least-once doc + idempotency_key example.
+- Doc comments na każdym public knob z "observable effect" + link do
+  testu.
+- Cargo.toml metadata.
+- Optional: tag v0.1.0 + crates.io.
 
-### Faza 10 — integracja z `rust_event_outbox`
+### Faza 10 — integracja z `rust_event_outbox` (osobny plan)
 
-- W `rust_event_outbox` v0.6:
-  - Drop `apalis`, `apalis-postgres` z deps.
-  - Dodaj `pg_work_queue = "0.1"` (lub path dep w workspace na start).
-  - W `dispatch_in_tx`: zamiast `apalis_postgres::sink::push_tasks`
-    użyj `pg_work_queue::Pusher::push_batch` z payload =
-    `DeliveryJob { delivery_id: i64, mode: Handler|Channel }`.
-  - W `outbox.rs::start_workers`: użyj `pg_work_queue::Worker::builder`.
-  - Drop `spawn_stale_reaper` — `pg_work_queue` ma własny reaper na
-    queue table. **Ale:** `outbox.*_deliveries.status='running'` lease
-    nadal wymaga osobnego mechanizmu (te tabele nie są zarządzane
-    przez pg_work_queue) — możliwie zachować outbox-side reaper jako
-    defense-in-depth dla deliveries.
-  - Drop `purge_apalis_done_jobs` + `apalis_done_retention` config —
-    `pg_work_queue` ma własny retention sweeper.
-  - Update wszystkie testy DB — `apalis.jobs` znika, zastąpione
-    `pgwq.jobs`.
-  - Update `pg::run_all_migrations` — usuń apalis migrator, dodaj
-    `pg_work_queue::migrator()`.
-  - Bump 0.5.0 → 0.6.0, breaking change, fresh schema, dokumentacja.
+Szczegóły migracji rust_event_outbox z apalis na pg_work_queue
+**MOVE TO `rust_event_outbox` repo plan**. Tutaj tylko jednolinijka:
+"v0.6.0 outboxa zamienia apalis → pg_work_queue; szczegóły w
+`rust_event_outbox/PLAN_v06.md`."
 
 ## Open questions / decisions TBD
 
-1. **MSRV** — Rust 2024 edition (1.85+). Konsystencja z apalis-postgres
-   i `rust_event_outbox`.
-2. **`payload BYTEA` vs `JSONB`** — BYTEA na start. JSONB jako opt-in
-   feature flag jeśli ktoś chce SQL-side filtering.
-3. **Multi-tenant via `queue` column** — single table, OK na start.
-4. **Plugin layer architecture (tower middleware)?** NIE. Handler to
-   prosta `async fn(T, JobContext) -> Outcome`.
-5. **Worker registration table (`pgwq.workers`)?** NIE.
-   Reaper używa `last_attempted_at` + `lease_token` jako proxy. Plus
-   lessons z apalisa (`apalis.workers` + advisory locks → leak +
-   stuck rows).
-6. **Idempotency key column (`unique_key TEXT UNIQUE NULL`)?** Niski-
-   -koszt nice-to-have, **nie na v0.1**. Add gdy user supply use case.
-7. **Tracing span structure** — `pg_work_queue.poll_tick`,
-   `pg_work_queue.claim_batch`, `pg_work_queue.handle_job`,
-   `pg_work_queue.reap_tick`, `pg_work_queue.retention_tick`. Każdy
-   z attrs: `queue`, `job.id`, `job.attempts`, `claimed_count`.
-8. **Multi-queue worker** — one-queue-per-worker na v0.1.
-9. **PgBouncer transaction-pooling compatibility** — brak
-   `LISTEN/NOTIFY`, brak session-scoped advisory locks → powinno
-   działać. Dodać test w CI matrix.
-10. **Generic vs concrete payload** — `Worker<T>` generic.
-11. **License** — MIT.
-12. **`Outcome::Pause` / `Outcome::Abort`?** Niepotrzebne na start.
-13. **PgQ/Kraken-style two-table design (jobs + jobs_archive)?**
-    Plan v1 trzyma jedną tabelę + retention sweeper. Two-table można
-    rozważyć jeśli `done` row volume + retention TTL daje > 10M rows
-    w hot table. Far future problem.
-
-## Wpływ na `rust_event_outbox` (bez zmian względem v0)
-
-### Public API zmiany (v0.5 → v0.6)
-
-- **`Outbox::start_workers(monitor)` → `Outbox::start_workers()`** —
-  zwraca `OutboxHandle { shutdown(timeout) }` zamiast `apalis Monitor`.
-  Breaking dla wszystkich konsumentów.
-- **`OutboxConfigBuilder` knoby zmiana**: dochodzi
-  `handler_poll_interval(Duration)` + `channel_poll_interval(Duration)`
-  (oba domyślnie 1s). Reszta (`max_attempts`, `concurrency`, retry
-  backoff) **bez zmian semantycznie** — pg_work_queue obsługuje to
-  samo.
-- **Drop `apalis_done_retention` + `purge_apalis_done_jobs`** — orphan
-  Done rows znikają wraz z apalis.
-- **Drop `ApalisConfig` reexport**.
-- **Wewnętrznie**: dispatch.rs używa `pg_work_queue::Pusher::push_batch`
-  zamiast `apalis_postgres::sink::push_tasks`. Reaper w outbox.rs
-  prawdopodobnie usuwalny dla queue jobs; outbox-side
-  `*_deliveries.status='running'` lease może wymagać osobnego mechanizmu.
-
-### Co zostaje bez zmian
-
-- Schema `outbox.*` (events, dispatch_keys, handler_deliveries,
-  channel_subscriptions, channel_deliveries).
-- Public API dispatch (`Outbox::dispatch<E: DomainEvent>(...)`),
-  history, subscriptions, channel impls, handler trait.
-- Handler context (`HandlerContext.delivery_id` — wciąż public_id UUID).
-- Retry semantics z perspektywy user'a (Transient/Permanent return
-  values — mapowane na `Outcome::Retry`/`Outcome::Dead`).
-- Reaper threshold + interval defaults.
-
-### Risk + mitigation
-
-- **Wszystkie obecne 44 testy DB to safety net.** Po migracji każdy
-  musi nadal przechodzić.
-- **Behavioral testy w pg_work_queue są red-first** (TDD od początku).
+1. **MSRV**: 1.85+ (edition 2024). Settled.
+2. **Multi-tenant via `queue` column** — single table na start. Settled.
+3. **Plugin/tower middleware** — NIE. Settled.
+4. **Worker registration table** — NIE. Settled.
+5. **Push-side idempotency column** (`unique_key TEXT UNIQUE`) — NIE w v0.1.
+6. **Multi-queue worker** — one-queue-per-worker w v0.1. `Worker::queues(&[...])`
+   to follow-up.
+7. **PgBouncer compat** — verify w CI matrix (no LISTEN/NOTIFY, no
+   session advisory locks → powinno działać; testcontainers `pgbouncer`
+   image w dedicated test).
+8. **License** — MIT. Settled.
+9. **PgQ/Kraken-style two-table** — far future, not v0.1.
+10. **`reaper_interval` validation cross-knob** — `<= lease_timeout/2`.
+    Hard validation in builder.
+11. **Reaper task panic recovery** — TBD: monitor + restart vs
+    log + dead worker? Phase 5 decision.
+12. **Tracing-subscriber default**: nie installuje subscribera by
+    default (library best practice — to user's app's responsibility).
 
 ## Anti-patterns z których wyciągnęliśmy lekcje
 
-Te zasady są **hard rules** w pg_work_queue:
+Hard rules:
 
-1. **Każdy public knob musi mieć integracyjny test który sprawdza
-   observable effect przy dwóch różnych wartościach.** Lesson z
-   `rust_event_outbox` v0.4 `handler_max_poll_backoff` bug'a.
+1. **Każdy public knob musi mieć behavioral test 2-wartościowy.**
 2. **Nie wystawiaj knoba dopóki nie zweryfikowałeś że jest READ w
-   hot-path.** Lesson z apalis `Config::with_poll_interval`.
-3. **Nie ufaj nazwie struct'a, dopóki nie przeczytałeś `Stream::poll_next`
-   / `Future::poll` implementation.** Lesson z apalis `PgPollFetcher`.
+   hot-path.** (apalis `Config::with_poll_interval` bug.)
+3. **Nie ufaj nazwie struct'a, dopóki nie przeczytałeś poll/Future
+   impl.**
 4. **Test który passował od pierwszego compile'a to red flag.** TDD
-   wymaga RED przed GREEN.
-5. **Verify-before-completion przed każdym claim "fix done".** Cargo
-   test passes ≠ fix works.
-6. **(nowy)** **Każdy `WHERE id = $1` UPDATE w state-machine musi mieć
-   dodatkowy guard.** Status guard (`AND status = ...`) nie wystarcza —
-   race window między reaper a worker. Fencing token (`AND lease_token
-   = $N`) wymagany. Lesson z apalis ack race.
-7. **(nowy)** **Każdy `pg_advisory_lock*` musi mieć udokumentowany
-   release path.** Lesson z apalis `register.sql` leak. (Stąd: my w
-   ogóle nie używamy advisory locks — eliminujemy klasę bugów.)
-8. **(nowy)** **Każdy commented-out kod w state-machine logic to bug
-   waiting to happen.** Lesson z apalis `AbortError` branch (literalnie
-   zakomentowany w `calculate_status`). Code review hard-blokuje
-   ten pattern.
+   wymaga RED.
+5. **Verify-before-completion przed każdym claim "fix done".**
+6. **Każdy state-machine UPDATE musi mieć status guard + fencing
+   token guard.** (apalis ack race + plan v1 reaper W1 bug.)
+7. **Nie używamy advisory locków.** Cała klasa bugów (apalis
+   `register.sql` leak).
+8. **Zero commented-out kodu w state-machine logic.** PR-blocker.
+   (apalis `AbortError` branch.)
+9. **`unwrap_used = deny`, `expect_used = deny`, `panic = deny`** w
+   `Cargo.toml`. Wszystkie error paths explicit. (apalis `Shared`
+   driver `.unwrap()` panics.)
+10. **All user-facing strings truncated at library boundary** zanim
+    wrzucą do DB lub logu. Plus DB CHECK jako backstop.
+11. **Background tasks restart-aware lub explicit-shutdown.** Reaper
+    task panic = worker shutdown (faza 5 decyzja).
 
 ## Roadmap
 
-1. **pg_work_queue v0.1.0** — Fazy 0-9 wyżej. ~2-3 dni roboty.
-2. **rust_event_outbox v0.6.0** — Faza 10. ~1-2 dni roboty.
-3. **(later) OSS publish** — crates.io publish dla pg_work_queue jeśli
-   wartościowe. README z demo + benchmark vs apalis-postgres.
+1. **pg_work_queue v0.1.0** — Fazy 1-9. ~3-4 dni roboty (więcej niż v1
+   estimate bo dochodzi observability spec + resource limits + idempotency
+   testing).
+2. **rust_event_outbox v0.6.0** — Faza 10 (osobny plan).
+3. **(later) OSS publish** — crates.io publish jeśli wartościowe.
 
 ## Co dalej
 
-Następny krok: faza 0 (repo init + skeleton + first migration).
-TDD od pierwszej linijki — nie commitujemy fazy 1 bez green
-`migrator_schema.rs` + `batch_push_throughput.rs`. Behavior-first,
-zawsze.
+Następny krok: **Faza 1** (Pusher + codec + migrator). TDD red-first
+— najpierw `tests/migrator_schema.rs` jako RED (asserts that schema
+exists with CHECK constraints, indexes, fillfactor), potem implementacja
+`migrator()`. Behavioral-first, zawsze.
