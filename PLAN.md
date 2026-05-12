@@ -84,7 +84,7 @@ fixnięte, (c) napisać własne. Wybieramy (c).
 | Config knobs nieczytane w hot-path (#1) | **Hard rule:** każdy knob ma behavioral test 2-wartościowy. PR review odrzuca knob bez testu. |
 | `pg_notify` per INSERT cluster lock (#2) | **No LISTEN/NOTIFY w ogóle.** Polling-only. Deterministyczny `poll_interval`. |
 | `ack=UPDATE` accumulation (#3) | `mark_done` → status='done' + finished_at; user wywołuje `pgwq::purge_done(pool, ttl)` ręcznie kiedy chce. Manual control, no surprise. |
-| RetryAfter duration ignored (#4) | `Outcome::Retry { in_: Some(d) }` przekłada się 1:1 na `run_at = now() + d` w `mark_retry` SQL. Test: `tests/retry_in_override.rs`. |
+| RetryAfter duration ignored (#4) | `Err(JobError::Retry { retry_in: Some(d), .. })` przekłada się 1:1 na `run_at = now() + d` w `mark_retry` SQL. Test: `tests/retry_in_override.rs`. |
 | Triple retry counter (#5) | **DB-side `attempts` jest single source of truth.** Brak in-memory retry budget. Reaper i mark_* używają tej samej kolumny. |
 | AbortError commented out (#6a) | Code review hard-rule: zero commented-out kodu w state-machine logic (PR-blocker). |
 | Advisory lock leak (#6b) | **Nie używamy advisory locków w ogóle.** Reaper przez SKIP LOCKED. |
@@ -94,7 +94,7 @@ fixnięte, (c) napisać własne. Wybieramy (c).
 | Broken stats.sql (#6g) | TDD + verify-before-completion: każda query exercised w teście. |
 | No CHECK on status (#7) | `pgwq.job_status` ENUM + `jobs_status_invariants CHECK` z explicit `(status, attempts, *_at, lease_token)` invariantami. |
 | `Backend` trait abstraction (#8) | **Brak Backend trait.** Library jest postgres-only, no abstraction layer. ~1.5–3 k LOC vs 13.8 k LOC apalis. |
-| `service_fn` macro (#10) | Handler jest po prostu `async fn(T, JobContext) -> Outcome`. Zero macro, zero lifetime puzzles. |
+| `service_fn` macro (#10) | Handler jest po prostu `async fn(T, JobContext) -> Result<(), JobError>`. Zero macro, zero lifetime puzzles, full `?` operator interop. |
 | `Monitor` complexity (#9) | `Worker::start() -> WorkerHandle`; `WorkerHandle::shutdown(timeout) -> Result<Stats>`. Jedna metoda, jeden cancellation token. |
 | Multi-backend leakage (#11) | Single-backend; `pgwq::*` re-eksportuje tylko to co aktualnie używa. |
 | Status as plain TEXT (#12) | ENUM + CHECK invariants enforced w DB. |
@@ -107,7 +107,7 @@ fixnięte, (c) napisać własne. Wybieramy (c).
 - **Brak multi-backend abstraction.** Postgres-only.
 - **Brak worker dashboard / GUI / metrics endpoint.**
 - **Brak Tower middleware stack.**
-- **Brak typed retry strategies w handler API.** Tylko `Outcome::Retry { reason, in_: Option<Duration> }` lub `Outcome::Dead { reason }`.
+- **Brak typed retry strategies w handler API.** Tylko `Err(JobError::Retry { reason, retry_in })` lub `Err(JobError::Abort { reason })`. `Ok(())` = done.
 - **Brak cross-worker priorities / fairness.**
 - **Brak automatycznego retention sweepera.** User wywołuje `pgwq::purge_done` / `pgwq::purge_dead` ręcznie kiedy chce (cron, tokio interval, manual). Library nie spawn'uje background cleanup task — user ma pełną kontrolę kiedy DELETE leci.
 - **Brak push-side dedup column (`unique_key TEXT UNIQUE`)** w v0.1. User może zrobić własny `INSERT...ON CONFLICT` przed `Pusher::push` jeśli potrzeba.
@@ -145,11 +145,11 @@ Handler który **musi** wykonać external side-effect dokładnie raz
 .handler(|task: ChargeTask, ctx: JobContext| async move {
     // Dedupe via idempotency_key — repeated invocations are no-ops.
     if redis.get(format!("charge:{}", ctx.idempotency_key)).await?.is_some() {
-        return Outcome::Done;
+        return Ok(());
     }
     stripe.charge(task.amount, &ctx.idempotency_key.to_string()).await?;
     redis.set(format!("charge:{}", ctx.idempotency_key), "1").await?;
-    Outcome::Done
+    Ok(())
 })
 ```
 
@@ -163,7 +163,7 @@ header — nasz UUID v7 jest perfect fit.
 ## Public API — sketch
 
 ```rust
-use pg_work_queue::{Worker, Outcome, JobContext, Pusher, BackoffPolicy, JsonCodec};
+use pg_work_queue::{Worker, JobError, JobContext, Pusher, BackoffPolicy, JsonCodec};
 use serde::{Serialize, Deserialize};
 use std::time::Duration;
 
@@ -199,14 +199,9 @@ async fn main() -> anyhow::Result<()> {
                 idempotency_key = %ctx.idempotency_key,
                 "handling email"
             );
-            match send_smtp(&task, &ctx.idempotency_key).await {
-                Ok(_) => Outcome::Done,
-                Err(e) if e.is_transient() => Outcome::Retry {
-                    reason: e.to_string(),
-                    in_: None, // backoff from policy
-                },
-                Err(e) => Outcome::Dead { reason: e.to_string() },
-            }
+            // SmtpError impls From<...> for JobError (defined elsewhere).
+            send_smtp(&task, &ctx.idempotency_key).await?;
+            Ok(())
         })
         .build()?;
 
@@ -273,7 +268,7 @@ ekspozuje intencję (use this for dedup). Handler używa `idempotency_key`.
 | `lease_timeout(Duration)` | 5min | ≥ poll_interval × 5 | stale-running threshold |
 | `reaper_interval(Duration)` | lease_timeout/4 | ≥ 1s, ≤ lease_timeout/2 | reaper tick cadence |
 | `batch_size(usize)` | 10 | 1..=1_000 | rows per claim_batch |
-| `retry_backoff(BackoffPolicy)` | `Exponential { 1s, 2.0, 5min, 0.2 }` | jitter ∈ [0,1], cap ≤ 24h | used when `Outcome::Retry { in_: None }` |
+| `retry_backoff(BackoffPolicy)` | `Exponential { 1s, 2.0, 5min, 0.2 }` | jitter ∈ [0,1], cap ≤ 24h | used when `JobError::Retry { retry_in: None, .. }` |
 | `panic_policy(PanicPolicy)` | `Retry` | enum: `Retry` \| `Dead` | what to do when handler panics |
 | `codec(impl Codec)` | `JsonCodec` | trait-bound | payload serialization |
 
@@ -819,7 +814,7 @@ Default: `Exponential { 1s, 2.0, 5min, 0.2 }` → ~1s, 2s, 4s, 8s, ... 5min
 Jitter ważny przy thundering herd (10 jobs fails równocześnie → bez jittera
 wszystkie wracają w tym samym ticku).
 
-User per-call override: `Outcome::Retry { in_: Some(d), .. }`.
+User per-call override: `Err(JobError::Retry { retry_in: Some(d), .. })`.
 **Cap**: `d` clamp'owany do `[Duration::ZERO, 24h]` żeby nie przyjmować
 `Duration::MAX` jako footgun.
 
@@ -875,33 +870,92 @@ pub enum PurgeError {
 }
 ```
 
-### Handler outcome semantics
+### Handler signature & error semantics
+
+Handler zwraca **`Result<(), JobError>`** — idiomatic Rust, kompozycja
+z `?` operatorem na user error types przez `From` impl.
 
 ```rust
-pub enum Outcome {
-    Done,
-    Retry { reason: String, in_: Option<Duration> },
-    Dead { reason: String },
+pub type HandlerResult = Result<(), JobError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum JobError {
+    /// Job miał transient issue — library decyduje retry-vs-dead na
+    /// bazie `attempts < max_attempts`. Optional `retry_in` override
+    /// backoff policy dla tego konkretnego retry.
+    #[error("retry: {reason}")]
+    Retry {
+        reason: String,
+        retry_in: Option<Duration>,
+    },
+    /// Job permanently can't proceed — mark_dead direct (bypass retry
+    /// budget). Użyj gdy retry nigdy nie pomoże (invalid input,
+    /// permissions denied, etc.).
+    #[error("abort: {reason}")]
+    Abort { reason: String },
+}
+
+impl JobError {
+    pub fn retry(reason: impl Into<String>) -> Self {
+        Self::Retry { reason: reason.into(), retry_in: None }
+    }
+    pub fn retry_in(reason: impl Into<String>, retry_in: Duration) -> Self {
+        Self::Retry { reason: reason.into(), retry_in: Some(retry_in) }
+    }
+    pub fn abort(reason: impl Into<String>) -> Self {
+        Self::Abort { reason: reason.into() }
+    }
 }
 ```
 
-Library applies:
-- `Done` → `mark_done` (fencing-guarded).
-- `Retry` → `mark_retry` z `run_at = now() + in_.unwrap_or_else(|| backoff.next(attempts))`.
-  Jeśli `attempts >= max_attempts` → upgrade do `mark_dead`.
-- `Dead` → `mark_dead` natychmiast (bypass attempts check).
-- **Panic** → per `PanicPolicy`:
-  - `PanicPolicy::Retry` (default) → `mark_retry` z `reason = "panic: <msg>"`.
-  - `PanicPolicy::Dead` → `mark_dead` z `reason = "panic: <msg>"`.
-- **Codec decode error** (worker can't deserialize payload) → `mark_dead`
-  natychmiast z `reason = "payload decode: <err>"`. NIE wywołuje handler.
-  Każdy retry attempt by ten sam decode-error miał → terminal natychmiast.
+User implementuje `From<MyError> for JobError` żeby propagować przez `?`:
+
+```rust
+impl From<sqlx::Error> for JobError {
+    fn from(e: sqlx::Error) -> Self {
+        JobError::retry(format!("db: {e}"))
+    }
+}
+
+impl From<StripeError> for JobError {
+    fn from(e: StripeError) -> Self {
+        match e {
+            StripeError::CardDeclined(_) => JobError::abort(format!("declined: {e}")),
+            _ => JobError::retry(format!("stripe: {e}")),
+        }
+    }
+}
+```
+
+Library mapping na DB state:
+
+| Handler return | DB action |
+|---|---|
+| `Ok(())` | `mark_done` (fencing-guarded) |
+| `Err(JobError::Retry { reason, retry_in })` | `mark_retry` z `run_at = now() + retry_in.unwrap_or_else(\|\| backoff.next(attempts))`; if `attempts >= max_attempts` → upgrade do `mark_dead` |
+| `Err(JobError::Abort { reason })` | `mark_dead` natychmiast (bypass retry budget) |
+| Panic | per `PanicPolicy`: `Retry` → `mark_retry`; `Dead` → `mark_dead` z `reason = "panic: <msg>"` |
+| Codec decode error (przed wywołaniem handlera) | `mark_dead` z `reason = "payload decode: <err>"` (handler nigdy nie called — retry by miał ten sam decode-error) |
+
+Pełny handler example z `?`:
+
+```rust
+.handler(|task: ChargeTask, ctx: JobContext| async move {
+    let user = db.find_user(task.user_id).await?;             // sqlx::Error → Retry
+    if user.banned {
+        return Err(JobError::abort("user banned"));
+    }
+    stripe.charge(task.amount, &ctx.idempotency_key.to_string()).await?;  // StripeError → Retry/Abort
+    db.record_charge(task.user_id, task.amount).await?;
+    Ok(())
+})
+```
 
 ### Library-side string truncation
 
-Wszystkie user-supplied `reason` strings (Outcome::Retry/Dead, panic
+Wszystkie user-supplied `reason` strings (`JobError::Retry/Abort`, panic
 message) **truncate'owane na library boundary** do `limits::MAX_LAST_ERROR_LEN`
-zanim go do `last_error`. Trim by char boundary safe (rust-safe-string-truncation
+zanim wejdą do `last_error`. Trim by char boundary safe (rust-safe-string-truncation
 skill). DB CHECK na 8 KiB jako backstop.
 
 Także `tracing::warn!(reason = %trim(reason))` — nie logujemy nieograniczonych
@@ -1011,8 +1065,8 @@ go w `#[tokio::test]` setup.
 
 ```rust
 pub struct Stats {
-    pub completed: u64,    // handlers returned Outcome::Done (mark_done ack'd)
-    pub failed: u64,       // handlers returned Outcome::Retry/Dead OR panicked
+    pub completed: u64,    // handlers returned Ok(()) (mark_done ack'd)
+    pub failed: u64,       // handlers returned Err(JobError::Retry/Abort) OR panicked
     pub aborted: u64,      // handlers aborted via JoinSet::abort_all (timeout)
 }
 ```
@@ -1052,7 +1106,7 @@ albo osobny schema w shared container — TBD per fixture cost).
 6. `tests/batch_size_behavior.rs` — claim shape przy 10 vs 50.
 7. `tests/scheduled_run_at.rs` — push z run_at = now()+2s.
 8. `tests/retry_backoff_behavior.rs` — Fixed vs Exponential run_at delta.
-9. `tests/retry_in_override.rs` — Outcome::Retry { in_: Some(5s) }.
+9. `tests/retry_in_override.rs` — `Err(JobError::Retry { retry_in: Some(5s), .. })`.
 10. `tests/panic_policy_behavior.rs` — PanicPolicy::Retry vs ::Dead.
 11. `tests/codec_swappable.rs` — JsonCodec vs custom CborCodec.
 
@@ -1180,10 +1234,11 @@ Commit `d9c4dc7`.
 
 ### Faza 6 — retry semantics + BackoffPolicy + panic policy
 
-- `Outcome::Retry { reason, in_ }` z fallback do policy + clamp `in_`.
+- `JobError::Retry { reason, retry_in }` z fallback do policy + clamp `retry_in`.
+- `JobError::Abort { reason }` → mark_dead direct (bypass retry budget).
 - `BackoffPolicy::{Linear, Exponential}` z jitter.
+- `From<E> for JobError` example impls dla typowych error types (sqlx, reqwest).
 - `mark_retry` ustawia `run_at = now() + duration`.
-- `Outcome::Dead` → mark_dead direct.
 - `PanicPolicy::{Retry, Dead}` + JoinError::is_panic handling.
 - Tests: `max_attempts_behavior.rs`, `scheduled_run_at.rs`,
   `retry_backoff_behavior.rs`, `retry_in_override.rs`,
