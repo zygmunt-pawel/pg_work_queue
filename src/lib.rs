@@ -10,6 +10,10 @@ pub mod migrator;
 pub mod pusher;
 pub mod worker;
 
+#[doc(hidden)]
+pub mod claim;
+pub(crate) mod job;
+pub(crate) mod mark;
 pub(crate) mod util;
 
 // Public API surface — only items defined in Faza 1 are re-exported here.
@@ -17,6 +21,7 @@ pub(crate) mod util;
 // and will be re-enabled as those phases land.
 pub use crate::codec::{Codec, JsonCodec};
 pub use crate::error::PushError;
+pub use crate::job::{Job, JobContext};
 pub use crate::migrator::migrator;
 pub use crate::pusher::Pusher;
 
@@ -31,5 +36,6 @@ pub use crate::pusher::Pusher;
 /// the public API; may change or vanish at any time.
 #[doc(hidden)]
 pub mod __test_exports {
+    pub use crate::claim::claim_and_decode;
     pub use crate::util::fmt_err_trimmed;
 }
