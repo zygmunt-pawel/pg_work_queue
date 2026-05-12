@@ -136,22 +136,31 @@ zawołany ≥1 raz dla tego samego logicznego jobu. Konkretnie:
   `lease_timeout >> p99 handler duration` żeby fenced-out był rzadkością.
   Statystyka `Stats::fenced_out` policzy te zdarzenia.
 
+**Semantyka `attempts`:** counter inkrementowany w `claim_batch`, czyli
+liczy **rozpoczęte attempts**, nie completed. Fence-out (handler success
+ale mark_done lost lease) **zlicza się jako attempt** — semantycznie:
+"job został odpalony N razy". Jeśli chcesz że `max_attempts=N` znaczy
+"N real retry chances after first try", ustaw `max_attempts ≥
+ceil(N × (1 + expected_fence_out_rate))`. Default `max_attempts=3` +
+prawidłowo skalibrowany `lease_timeout` (fence_out_rate ≈ 0) daje
+3 real chances.
+
 ### Handler-side idempotency contract
 
-`JobContext` zawiera pole **`idempotency_key: Uuid`** które:
+`JobContext` zawiera **`public_id: Uuid`** które:
 
-1. Jest **stabilne across retries** dla tego samego jobu (= `public_id`
-   ustawione na push).
+1. Jest **stabilne across retries** dla tego samego jobu (jednorazowo
+   ustawione na push, niezmienne podczas retries).
 2. Jest **unikalne per logical operation** (UUIDv7, near-zero collision).
 3. Jest **przekazywane do handlera w każdym attempt**.
 
 Handler który **musi** wykonać external side-effect dokładnie raz
 (np. SMTP send, payment charge, webhook POST) **musi** używać
-`idempotency_key` do dedup'u:
+`ctx.idempotency_key` jako idempotency key dla dedup'u:
 
 ```rust
 .handler(|task: ChargeTask, ctx: JobContext| async move {
-    // Dedupe via idempotency_key — repeated invocations are no-ops.
+    // Dedupe via public_id (stable across retries) — repeated invocations no-op.
     if redis.get(format!("charge:{}", ctx.idempotency_key)).await?.is_some() {
         return Ok(());
     }
@@ -163,9 +172,9 @@ Handler który **musi** wykonać external side-effect dokładnie raz
 
 Library **nie ma sposobu** dać exactly-once external side-effects.
 To jest fundamentalny limit każdej polling queue. **Handler dostaje
-narzędzie (`idempotency_key`); użycie jest jego odpowiedzialnością.**
+narzędzie (`ctx.idempotency_key`); użycie jest jego odpowiedzialnością.**
 
-External APIs (Stripe, AWS, etc.) standardowo wspierają `idempotency_key`
+External APIs (Stripe, AWS, etc.) standardowo wspierają `Idempotency-Key`
 header — nasz UUID v7 jest perfect fit.
 
 ## Public API — sketch
@@ -252,18 +261,22 @@ async fn main() -> anyhow::Result<()> {
 ```rust
 pub struct JobContext {
     pub id: i64,                       // internal BIGINT PK
-    pub public_id: Uuid,               // = idempotency_key (alias)
-    pub idempotency_key: Uuid,         // stable across retries
-    pub queue: String,                 // queue name (cloned for handler)
+    pub public_id: Uuid,               // external job handle (= idempotency_key, same value)
+    pub idempotency_key: Uuid,         // stable across retries; use as Idempotency-Key for external APIs
+    pub queue: String,
     pub attempt: u32,                  // 1-indexed, current attempt
     pub first_attempted_at: DateTime<Utc>,
     pub lease_token: Uuid,             // current claim's fencing token
 }
 ```
 
-`idempotency_key` i `public_id` to ta sama wartość (alias dla readability).
-`public_id` ekspozuje implementację (UUID v7 zegarodatowy), `idempotency_key`
-ekspozuje intencję (use this for dedup). Handler używa `idempotency_key`.
+`public_id` i `idempotency_key` to ta sama wartość (alias dla
+readability). `public_id` matches DB column name, `idempotency_key`
+matches handler intent. Handler:
+
+```rust
+stripe.charge(amount, &ctx.idempotency_key.to_string()).await?;
+```
 
 ### Builder knobs (każdy z behavioral testem przy 2 wartościach)
 
@@ -379,22 +392,26 @@ CREATE TABLE pgwq.jobs (
             AND last_attempted_at IS NULL
             AND first_attempted_at IS NULL
             AND finished_at IS NULL
-            AND lease_token IS NULL)
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL)
         OR (status = 'running'
             AND attempts > 0
             AND last_attempted_at IS NOT NULL
             AND first_attempted_at IS NOT NULL
             AND finished_at IS NULL
-            AND lease_token IS NOT NULL)
+            AND lease_token IS NOT NULL
+            AND lease_expires_at IS NOT NULL)
         OR (status = 'awaiting_retry'
             AND attempts > 0
             AND last_attempted_at IS NOT NULL
             AND first_attempted_at IS NOT NULL
             AND finished_at IS NULL
-            AND lease_token IS NULL)
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL)
         OR (status IN ('done', 'dead')
             AND finished_at IS NOT NULL
-            AND lease_token IS NULL)
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL)
     )
 );
 
@@ -413,8 +430,12 @@ CREATE INDEX jobs_claim_idx
     WHERE status IN ('queued', 'awaiting_retry');
 
 -- Reaper hot path
+-- Per-row deadline (set by claim using THIS worker's lease_timeout).
+-- Reaper compares now() > lease_expires_at; bez tego heterogeneous deploy
+-- (Worker A lease=30s, Worker B lease=10min, ten sam queue) by powodował
+-- że A reapuje B-running joby.
 CREATE INDEX jobs_reap_idx
-    ON pgwq.jobs (last_attempted_at)
+    ON pgwq.jobs (lease_expires_at)
     WHERE status = 'running';
 
 -- Purge functions hot path
@@ -566,11 +587,12 @@ SET status = 'running',
     attempts = j.attempts + 1,
     last_attempted_at = now(),
     first_attempted_at = COALESCE(j.first_attempted_at, now()),
-    lease_token = gen_random_uuid()
+    lease_token = gen_random_uuid(),
+    lease_expires_at = now() + $3::interval  -- $3 = THIS worker's lease_timeout
 FROM claimed
 WHERE j.id = claimed.id
 RETURNING j.id, j.public_id, j.queue, j.payload, j.attempts,
-          j.first_attempted_at, j.lease_token;
+          j.first_attempted_at, j.lease_token, j.lease_expires_at;
 ```
 
 (`updated_at` ustawia trigger, nie explicit SET.)
@@ -586,25 +608,26 @@ WITH stale AS (
     SELECT id, attempts FROM pgwq.jobs
     WHERE queue = $1                          -- per-queue isolation
       AND status = 'running'
-      AND last_attempted_at < now() - $2::interval
-    ORDER BY last_attempted_at
-    LIMIT $3
+      AND lease_expires_at < now()            -- per-row deadline (set at claim)
+    ORDER BY lease_expires_at
+    LIMIT $2
     FOR UPDATE SKIP LOCKED
 )
 UPDATE pgwq.jobs j
 SET status = CASE
-        WHEN s.attempts >= $4 THEN 'dead'::pgwq.job_status
+        WHEN s.attempts >= $3 THEN 'dead'::pgwq.job_status
         ELSE 'awaiting_retry'::pgwq.job_status
     END,
     finished_at = CASE
-        WHEN s.attempts >= $4 THEN now()
+        WHEN s.attempts >= $3 THEN now()
         ELSE NULL
     END,
     last_error = COALESCE(j.last_error, CASE
-        WHEN s.attempts >= $4 THEN 'lease_expired_max_attempts'
+        WHEN s.attempts >= $3 THEN 'lease_expired_max_attempts'
         ELSE 'lease_expired'
     END),
-    lease_token = NULL
+    lease_token = NULL,
+    lease_expires_at = NULL
 FROM stale s
 WHERE j.id = s.id
   AND j.status = 'running'                    -- defense-in-depth (matches partial index)
@@ -678,30 +701,34 @@ async fn reaper_loop(state: Arc<WorkerState>) {
 
 ### Reaper panic recovery
 
-**Decyzja (W10 z review):** reaper tick wrapped w `AssertUnwindSafe(...).catch_unwind()`
-— per-tick panic isolated, log + counter, **escalate do worker shutdown
-po K=3 consecutive ticki z panic**:
+**Decyzja (W10 z review):** reaper tick wrapped w `tokio::spawn` →
+`JoinHandle` → `JoinError::is_panic()`. **Nie** używamy `futures::catch_unwind`
+(brak `futures-util` w deps; plus `catch_unwind` na async fn miałby
+wymagać `UnwindSafe` bounds problematycznych dla `&PgPool`). `JoinSet` /
+`JoinHandle::await` natywnie surface'uje panic via `JoinError`. K=3
+consecutive panic ticks → worker shutdown:
 
 ```rust
 const REAPER_PANIC_ESCALATION_THRESHOLD: u32 = 3;
 
 let mut consecutive_panics = 0;
 loop {
-    let result = AssertUnwindSafe(async {
+    let state = state.clone();
+    let tick = tokio::spawn(async move {
         reap(&state.pool, &state.queue, ...).await
-    }).catch_unwind().await;
+    });
 
-    match result {
+    match tick.await {
         Ok(Ok(reaped)) => { consecutive_panics = 0; emit_events(&reaped); }
         Ok(Err(e)) if is_fatal_sqlx(&e) => {
-            state.last_fatal.lock().get_or_insert_with(|| Arc::new(e));
+            let _ = state.last_fatal.set(Arc::new(e));
             state.shutdown.cancel();
             return;
         }
         Ok(Err(e)) => { consecutive_panics = 0; tracing::warn!(error = %e, "reap tick failed"); }
-        Err(panic_payload) => {
+        Err(je) if je.is_panic() => {
             consecutive_panics += 1;
-            let msg = extract_panic_message(&panic_payload);
+            let msg = extract_panic_message(je);
             tracing::error!(panic = %msg, consecutive = consecutive_panics,
                 "reaper tick panicked");
             if consecutive_panics >= REAPER_PANIC_ESCALATION_THRESHOLD {
@@ -711,9 +738,27 @@ loop {
                 return;
             }
         }
+        Err(_je_cancelled) => return, // task aborted via abort_handle
+    }
+}
+
+fn extract_panic_message(je: tokio::task::JoinError) -> String {
+    match je.try_into_panic() {
+        Ok(payload) => match payload.downcast::<&'static str>() {
+            Ok(s) => s.to_string(),
+            Err(payload) => match payload.downcast::<String>() {
+                Ok(s) => *s,
+                Err(_) => "<unknown panic payload>".to_string(),
+            }
+        }
+        Err(_) => "<task cancelled before panic>".to_string(),
     }
 }
 ```
+
+Codec decode w worker (`handle_job`) używa tego samego patternu —
+`tokio::spawn(decode_fn)` then await → panic w codec → mark_dead z
+`reason = "codec panic: ..."`.
 
 Test: `tests/reaper_recovers_from_tick_panic.rs` (inject panic via test-only
 hook, assert worker survives ≤2 panics, dies on 3rd).
@@ -723,20 +768,25 @@ hook, assert worker survives ≤2 panics, dies on 3rd).
 ```sql
 -- mark_done
 UPDATE pgwq.jobs
-SET status = 'done', finished_at = now(), last_error = NULL, lease_token = NULL
+SET status = 'done', finished_at = now(), last_error = NULL,
+    lease_token = NULL, lease_expires_at = NULL
 WHERE id = $1 AND status = 'running' AND lease_token = $2;
 
 -- mark_retry
 UPDATE pgwq.jobs
-SET status = 'awaiting_retry', last_error = $3, run_at = $4, lease_token = NULL
+SET status = 'awaiting_retry', last_error = $3, run_at = $4,
+    lease_token = NULL, lease_expires_at = NULL
 WHERE id = $1 AND status = 'running' AND lease_token = $2;
 
 -- mark_dead
+-- WHERE status = 'running' only — worker calls mark_dead tylko dla wierszy
+-- które właśnie wykonał (handler zwrócił JobError::Abort lub retry-upgrade
+-- po max_attempts). Path awaiting_retry → dead należy do reaper'a (single
+-- CTE z CASE WHEN attempts >= max_attempts), nie do worker'a.
 UPDATE pgwq.jobs
-SET status = 'dead', finished_at = now(), last_error = $3, lease_token = NULL
-WHERE id = $1
-  AND status IN ('running', 'awaiting_retry')
-  AND lease_token = $2;
+SET status = 'dead', finished_at = now(), last_error = $3,
+    lease_token = NULL, lease_expires_at = NULL
+WHERE id = $1 AND status = 'running' AND lease_token = $2;
 ```
 
 **0-rows-affected reactions** (explicit):
@@ -939,16 +989,48 @@ Górny clamp 24h zapobiega `Duration::MAX` jako footgun.
 ```rust
 #[derive(thiserror::Error, Debug)]
 pub enum PushError {
+    // Caller bugs — NOT retriable. Don't propagate to backoff loops.
     #[error("payload too large: {size} bytes > {max}")]
     PayloadTooLarge { index: usize, size: usize, max: usize },
     #[error("batch too large: {size} > {max}")]
     BatchTooLarge { size: usize, max: usize },
+    #[error("batch aggregate payload exceeds {max} bytes")]
+    BatchPayloadTooLarge { total_bytes: usize, max: usize },
+    #[error("batch is empty")]
+    BatchEmpty,
     #[error("queue name invalid: {0}")]
     QueueNameInvalid(String),
     #[error("codec error: {0}")]
     Codec(#[source] BoxError),
-    #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
+    #[error("codec error at batch index {index}: {source}")]
+    BatchCodec { index: usize, #[source] source: BoxError },
+
+    // Deterministic DB errors (CHECK violation, FK, integrity) — also caller bug.
+    #[error("database constraint violation: {0}")]
+    Constraint(#[source] sqlx::Error),
+    // Transient DB errors (connection, IO) — caller may retry.
+    #[error("database error (transient): {0}")]
+    Transient(#[source] sqlx::Error),
+}
+
+impl PushError {
+    /// True if calling code may retry (transient infra). False if request itself
+    /// is invalid (caller bug — fix the input, don't loop).
+    pub fn is_retriable(&self) -> bool {
+        matches!(self, PushError::Transient(_))
+    }
+}
+
+impl From<sqlx::Error> for PushError {
+    fn from(e: sqlx::Error) -> Self {
+        // Classify SQLSTATE 23xxx (integrity constraint violation) as deterministic.
+        if let sqlx::Error::Database(db) = &e {
+            if db.code().as_deref().is_some_and(|c| c.starts_with("23")) {
+                return PushError::Constraint(e);
+            }
+        }
+        PushError::Transient(e)
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -1028,20 +1110,27 @@ impl JobError {
 }
 ```
 
-User implementuje `From<MyError> for JobError` żeby propagować przez `?`:
+User implementuje `From<MyError> for JobError` żeby propagować przez `?`.
+**Ważne:** zgodnie z §"Sensitive data warning" — log full error
+internally (gdzie operator może zobaczyć stack), pass **opaque category**
+do `JobError`. Przykład:
 
 ```rust
 impl From<sqlx::Error> for JobError {
     fn from(e: sqlx::Error) -> Self {
-        JobError::retry(format!("db: {e}"))
+        // Log full error to operator log only — never persist e.to_string()
+        // bo może zawierać connection strings, payload fragmenty, PII.
+        tracing::error!(error = ?e, "handler db error");
+        JobError::retry("db_error")  // opaque category, no e.to_string()
     }
 }
 
 impl From<StripeError> for JobError {
     fn from(e: StripeError) -> Self {
+        tracing::error!(error = ?e, "handler stripe error");
         match e {
-            StripeError::CardDeclined(_) => JobError::abort(format!("declined: {e}")),
-            _ => JobError::retry(format!("stripe: {e}")),
+            StripeError::CardDeclined(_) => JobError::abort("card_declined"),
+            _ => JobError::retry("stripe_error"),
         }
     }
 }
@@ -1055,7 +1144,7 @@ Library mapping na DB state:
 | `Err(JobError::Retry { reason, retry_in })` | `mark_retry` z `run_at = now() + retry_in.unwrap_or_else(\|\| backoff.next(attempts))`; if `attempts >= max_attempts` → upgrade do `mark_dead` |
 | `Err(JobError::Abort { reason })` | `mark_dead` natychmiast (bypass retry budget) |
 | Panic | per `PanicPolicy`: `Retry` → `mark_retry`; `Dead` → `mark_dead` z `reason = "panic: <msg>"` |
-| Codec decode error (przed wywołaniem handlera) | `mark_dead` z `reason = "payload decode: <err>"` (handler nigdy nie called — retry by miał ten sam decode-error) |
+| Codec decode error (przed wywołaniem handlera) | `mark_dead` z `reason = "payload decode: <err>"` (handler nigdy nie called — retry by miał ten sam decode-error). **Jeśli mark_dead samo zawiedzie** (DB error) — `warn!` + leave row `running`; reaper recover'i przez lease expiration → kolejne attempts spalą `max_attempts` → final `dead` z `last_error = 'lease_expired_max_attempts'`. Bounded loop, ale slow. |
 
 Pełny handler example z `?`:
 
@@ -1170,31 +1259,63 @@ Tracing-first observability. Każda critical operacja ma:
 
 ### State transition events
 
-Każde state transition emituje `tracing::info!` (lub `tracing::error!`
-dla dead-letter) event z structured attrs:
+Każde state transition emituje structured event przez **`emit_transition`
+single-source helper** — wszystkie 5+ call sites (mark_done, mark_retry,
+mark_dead, reaper transitions, purge) muszą tej fn używać żeby attrs
+nie drift'owały:
 
 ```rust
-tracing::info!(
-    job.id = id,
-    job.public_id = %public_id,
-    queue = %queue,
-    status.from = "running",
-    status.to = "done",
-    "pgwq.state.transition"
-);
+pub(crate) enum TransitionSource { Worker, Reaper, Purge }
+
+pub(crate) struct TransitionCtx<'a> {
+    pub job_id: i64,
+    pub public_id: Uuid,
+    pub queue: &'a str,
+    pub attempts: u32,
+    pub source: TransitionSource,
+    pub reason: Option<&'a str>,    // not logged at ERROR level
+    pub lost_race: bool,            // mark_* 0-rows-affected
+}
+
+pub(crate) fn emit_transition(from: Option<&str>, to: &str, ctx: TransitionCtx<'_>) {
+    let level = match to {
+        "dead" => tracing::Level::ERROR,
+        "done" | "awaiting_retry" => tracing::Level::INFO,
+        _ => tracing::Level::DEBUG,
+    };
+    // OTel convention: event name jako tracing `target`, nie message body.
+    // Plus `messaging.*` semantic conventions.
+    tracing::event!(
+        target: "pgwq.state.transition",
+        level,
+        job.id = ctx.job_id,
+        job.public_id = %ctx.public_id,
+        queue = ctx.queue,
+        job.attempts = ctx.attempts,
+        status.from = from.unwrap_or("none"),
+        status.to = to,
+        source = ?ctx.source,
+        lost_race = ctx.lost_race,
+        // reason only at INFO/DEBUG; ERROR gets metadata only (PII safety).
+        reason_length = ctx.reason.map(|r| r.len()),
+        reason_present = ctx.reason.is_some(),
+        reason = ctx.reason,  // tracing.event handles None gracefully
+    );
+}
 ```
 
 Tabela:
 
-| From → To | Level | When |
+| From → To | Level | Event volume / strategy |
 |---|---|---|
-| → `queued` | `info` | push, push_batch (1 event per row inserted) |
-| `queued` → `running` | `debug` | claim_batch (1 event per row claimed) |
-| `awaiting_retry` → `running` | `debug` | claim_batch (re-attempt) |
-| `running` → `done` | `info` | mark_done success |
-| `running` → `awaiting_retry` | `info` | mark_retry success (handler retry or reaper) |
-| `running` → `dead` | **`error`** | mark_dead (max_attempts exhausted) — **dead-letter** |
-| `dead`/`done` → ∅ | `info` | purge_done / purge_dead delete |
+| → `queued` (single push) | `info` | 1 event per `Pusher::push` |
+| → `queued` (push_batch) | `info` aggregate + `trace` per-row | **1 summary event** (`count`, `first_public_id`, `last_public_id`) — per-row would log-DoS przy 10k batchach. Per-row na `trace` jeśli operator chce drill-down. |
+| `queued` → `running` | `debug` | 1 event per row claimed |
+| `awaiting_retry` → `running` | `debug` | 1 event per row claimed |
+| `running` → `done` | `info` | 1 event per mark_done success |
+| `running` → `awaiting_retry` | `info` | mark_retry (worker) or reaper |
+| `running` → `dead` | **`error`** | mark_dead (max_attempts) — **dead-letter**; `reason_length: usize` + `reason_present: bool` attrs (no `reason` body at ERROR level for PII reasons) |
+| `dead`/`done` → ∅ | `info` aggregate | purge_done / purge_dead: 1 event per call z `deleted: count` |
 
 ### Worker identity
 
@@ -1242,9 +1363,18 @@ pub struct Stats {
 ```
 
 Implementacja: `AtomicU64` per field z `Ordering::Relaxed` (one writer
-per field; reader just snapshots at shutdown). `last_fatal: Mutex<Option<Arc<sqlx::Error>>>`
-w `WorkerState` (sqlx::Error nie jest `Clone`; Arc allows surfacing
-przez `ShutdownError::Fatal(Arc<sqlx::Error>)`).
+per field; reader just snapshots at shutdown). `last_fatal:
+std::sync::OnceLock<Arc<sqlx::Error>>` w `WorkerState` — stdlib set-once
+primitive bez poison semantics (Mutex z `unwrap_used = deny` byłby
+awkward). First fatal wins:
+
+```rust
+let _ = state.last_fatal.set(Arc::new(e)); // Err if already set, ignored
+// At shutdown:
+state.last_fatal.get().cloned()  // Option<Arc<sqlx::Error>>
+```
+
+`ShutdownError::Fatal(Arc<sqlx::Error>)` propaguje to user'owi.
 
 **Aborted handlers semantics:** ich rows zostają `status='running'` z
 aktualnym `lease_token`. Reaper-side recovery (po `lease_timeout`) flipuje

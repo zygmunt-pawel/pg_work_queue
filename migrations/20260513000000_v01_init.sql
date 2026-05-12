@@ -60,6 +60,11 @@ CREATE TABLE pgwq.jobs (
     -- Required for mark_done/retry/dead WHERE clauses to prevent the
     -- reaper-vs-old-worker race that apalis-postgres has.
     lease_token        UUID,
+    -- Lease deadline set BY CLAIMING WORKER (now() + that worker's lease_timeout).
+    -- Reaper compares `now() > lease_expires_at` per-row, so heterogeneous
+    -- replicas (rolling deploy with different lease_timeout values) don't
+    -- prematurely reap each other's still-alive jobs. NULL when not running.
+    lease_expires_at   TIMESTAMPTZ,
     last_error         TEXT,
     last_attempted_at  TIMESTAMPTZ,
     first_attempted_at TIMESTAMPTZ,
@@ -108,16 +113,19 @@ CREATE TABLE pgwq.jobs (
             AND last_attempted_at IS NOT NULL
             AND first_attempted_at IS NOT NULL
             AND finished_at IS NULL
-            AND lease_token IS NOT NULL)
+            AND lease_token IS NOT NULL
+            AND lease_expires_at IS NOT NULL)
         OR (status = 'awaiting_retry'
             AND attempts > 0
             AND last_attempted_at IS NOT NULL
             AND first_attempted_at IS NOT NULL
             AND finished_at IS NULL
-            AND lease_token IS NULL)
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL)
         OR (status IN ('done', 'dead')
             AND finished_at IS NOT NULL
-            AND lease_token IS NULL)
+            AND lease_token IS NULL
+            AND lease_expires_at IS NULL)
     )
 );
 
@@ -136,10 +144,11 @@ CREATE INDEX jobs_claim_idx
     ON pgwq.jobs (queue, run_at, id)
     WHERE status IN ('queued', 'awaiting_retry');
 
--- Reaper hot path. Scan only rows that COULD be stale (status='running');
--- WHERE clause keeps the index tiny relative to total table size.
+-- Reaper hot path. Indexed on lease_expires_at (per-row deadline set by
+-- claim) instead of last_attempted_at — heterogeneous deployments with
+-- different lease_timeout per replica must respect each row's own lease.
 CREATE INDEX jobs_reap_idx
-    ON pgwq.jobs (last_attempted_at)
+    ON pgwq.jobs (lease_expires_at)
     WHERE status = 'running';
 
 -- Purge functions hot path. `pgwq::purge_done(pool, age)` and
