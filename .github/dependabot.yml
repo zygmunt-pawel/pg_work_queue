@@ -16,6 +16,13 @@ updates:
     commit-message:
       prefix: ci
       include: scope
+    ignore:
+      # `dtolnay/rust-toolchain` uses tags that name a Rust toolchain
+      # (`stable`, `nightly`, `1.88`), not action versions. Dependabot
+      # mis-reads `1.85 → 1.100` etc. as semver bumps; we manage the
+      # MSRV pin manually via Cargo.toml `package.rust-version` and the
+      # MSRV CI job. Update this action only when bumping MSRV.
+      - dependency-name: dtolnay/rust-toolchain
 
   # `cargo` ecosystem is intentionally NOT enabled here. Cargo.toml uses
   # exact-version pins (`=0.8.6`, `=1.52.3`, …) — see the rationale in
