@@ -11,5 +11,7 @@
 /// ```
 #[must_use]
 pub fn migrator() -> sqlx::migrate::Migrator {
-    sqlx::migrate!("./migrations")
+    let mut m = sqlx::migrate!("./migrations");
+    m.set_ignore_missing(true);
+    m
 }
