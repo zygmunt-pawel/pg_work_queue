@@ -14,12 +14,22 @@ on:
       - 'Cargo.lock'
       - 'deny.toml'
       - '.github/workflows/audit.yml'
-  # Daily refresh — picks up newly-published RustSec advisories even
-  # when the codebase hasn't moved. 06:13 UTC = off-peak, off any
-  # round-hour spike on shared GH-hosted runners.
+  # Every-6h refresh — picks up newly-published RustSec advisories even
+  # when the codebase hasn't moved. `:13` offset off any round-hour spike
+  # on shared GH-hosted runners; 4 runs/day (00:13, 06:13, 12:13, 18:13
+  # UTC) is the sweet spot between time-to-detect and CI minute spend.
+  # Tighten further (e.g. `*/30 * * * *`) only if RustSec publishing
+  # cadence justifies it — today it doesn't.
   schedule:
-    - cron: '13 6 * * *'
+    - cron: '13 */6 * * *'
   workflow_dispatch:
+
+# Same group as the CI workflow uses but on its own ref — cancel in-flight
+# audits when a newer commit arrives. The cron-triggered run uses a synthetic
+# ref so cron runs never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

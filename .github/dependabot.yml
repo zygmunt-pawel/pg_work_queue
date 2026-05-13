@@ -24,10 +24,32 @@ updates:
       # MSRV CI job. Update this action only when bumping MSRV.
       - dependency-name: dtolnay/rust-toolchain
 
-  # `cargo` ecosystem is intentionally NOT enabled here. Cargo.toml uses
-  # exact-version pins (`=0.8.6`, `=1.52.3`, …) — see the rationale in
-  # CLAUDE.md and the Cargo.toml comment block. Dependabot would either
-  # flood the repo with `=` bump PRs or be unable to act with
-  # `versioning-strategy: lockfile-only` (lockfile is fully constrained
-  # by the `=` pins). Vulnerability surveillance for Rust deps is handled
-  # by the daily cargo-deny advisories check in `.github/workflows/audit.yml`.
+  # Cargo crates — daily check. `Cargo.toml` uses exact-version pins
+  # (`=0.8.6`, `=1.52.3`, …); Dependabot honors the `=` operator and
+  # rewrites the pin to the new exact version (e.g. `=0.8.6` → `=0.8.7`),
+  # so the supply-chain posture is preserved while we get a PR per bump.
+  #
+  # Expect 2-5 PRs/week in a calm week, ~10-15 during major release storms
+  # (tokio + sqlx + rustls cluster). `open-pull-requests-limit: 10` caps
+  # concurrent open bump PRs — older ones close automatically when a newer
+  # bump for the same crate appears. Patch+minor bumps for direct deps
+  # plus their `[dev-dependencies]` are both in scope.
+  #
+  # Cross-checked by:
+  #   - `audit.yml` cargo-deny cron (every 6h) — known RustSec advisories
+  #     fail CI even when no PR is open.
+  #   - `deny.toml` `[bans] wildcards = "deny"` — a Dependabot PR can
+  #     never relax an `=` pin to `^x.y`; that would fail audit.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+      time: '06:00'
+      timezone: Europe/Warsaw
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: deps
+      include: scope
