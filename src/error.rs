@@ -351,18 +351,54 @@ pub enum StartError {
     Database(#[source] sqlx::Error),
 }
 
-/// Errors returned by `WorkerHandle::join` after the poll loop exits.
+/// Errors returned by [`crate::worker::WorkerHandle::join`] /
+/// [`crate::worker::WorkerHandle::shutdown`].
 ///
-/// Faza 4 surfaces only the `Fatal` variant — fired when the poll loop
-/// classifies a `sqlx::Error` as fatal via `is_fatal_sqlx` and self-shuts
-/// down. Faza 7 adds `AlreadyShutdown` and `Timeout` for the richer
-/// `shutdown(timeout)` API.
+/// `Fatal` lands w Faza 4 — fired when the poll loop or reaper classifies a
+/// `sqlx::Error` as fatal via `is_fatal_sqlx` and self-shuts down. Faza 7 adds
+/// `Timeout`, `AlreadyShutdown` (reserved for v0.2 — drop-time double-shutdown
+/// detection) and `ReaperPanicEscalation` (programmatic surface for the Phase 5
+/// reaper-panic-threshold escalation; previously observable only via
+/// `tracing::error!`).
+///
+/// Precedence when multiple terminal conditions fire concurrently: `Fatal` wins
+/// over `ReaperPanicEscalation` wins over `Timeout`.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum ShutdownError {
-    /// Worker self-shut-down after a fatal `sqlx::Error` in the poll loop.
-    /// `Arc<sqlx::Error>` because `WorkerState::last_fatal` is shared with
-    /// other observers (Faza 7 `Stats` snapshot).
+    /// Worker self-shut-down after a fatal `sqlx::Error` in the poll loop or
+    /// reaper. `Arc<sqlx::Error>` because `WorkerState::last_fatal` is shared
+    /// with other observers (Faza 7 `Stats` snapshot).
     #[error("worker failed with fatal error: {0}")]
     Fatal(Arc<sqlx::Error>),
+
+    /// `shutdown(timeout)` could not complete the drain within the supplied
+    /// `timeout`. Currently unreachable from `WorkerHandle::shutdown` — the
+    /// implementation always builds a best-effort `Stats` snapshot rather than
+    /// returning this variant; reserved for future strict-mode shutdown.
+    #[error("shutdown timeout elapsed: {timeout:?}")]
+    Timeout {
+        /// Timeout supplied to `shutdown(timeout)` that elapsed.
+        timeout: Duration,
+    },
+
+    /// `shutdown(timeout)` invoked twice on what is logically the same
+    /// `WorkerHandle`. The current API consumes `self` so this is
+    /// unreachable via the public surface; reserved for v0.2 when a
+    /// `Drop`-time double-shutdown guard or `&mut self`-based API may
+    /// land.
+    #[error("shutdown already called")]
+    AlreadyShutdown,
+
+    /// Reaper task panicked `consecutive_panics` ticks in a row (≥
+    /// [`crate::reaper::REAPER_PANIC_ESCALATION_THRESHOLD`]) and self-cancelled
+    /// the worker. No `sqlx::Error` is involved, so this is distinct from
+    /// `Fatal`. Operators previously detected this only via
+    /// `tracing::error!` events on `pgwq.reaper.escalation`.
+    #[error("reaper exceeded panic threshold: {consecutive_panics} consecutive panic ticks")]
+    ReaperPanicEscalation {
+        /// Number of consecutive panicking reaper ticks observed before
+        /// escalation fired.
+        consecutive_panics: u32,
+    },
 }

@@ -105,9 +105,14 @@ pub struct TickStats {
     pub fenced_out: u64,
 }
 
-/// Atomic counterpart of [`TickStats`] plus the Faza 4 timeout-related
-/// counters. Each field is monotonically incremented; readers snapshot via
-/// `load(Relaxed)`. Faza 7 grows this with `aborted` and `pending_recovery`.
+/// Atomic counterpart of [`Stats`] used internally by the running worker.
+/// Each field is monotonically incremented from at most one writer (handler
+/// task or shutdown drain); readers snapshot via [`AtomicStats::snapshot`].
+///
+/// `aborted` is bumped by `WorkerHandle::shutdown` for handlers that were
+/// still in-flight when `JoinSet::abort_all` fired. `pending_recovery` is NOT
+/// stored here — `shutdown` queries the DB once at the end of the drain
+/// (under a small timeout) and folds the result into the returned `Stats`.
 #[derive(Debug, Default)]
 pub(crate) struct AtomicStats {
     pub(crate) completed: AtomicU64,
@@ -115,6 +120,69 @@ pub(crate) struct AtomicStats {
     pub(crate) fenced_out: AtomicU64,
     pub(crate) timed_out: AtomicU64,
     pub(crate) mark_timed_out: AtomicU64,
+    pub(crate) aborted: AtomicU64,
+}
+
+impl AtomicStats {
+    /// Snapshot the running counters into a `Stats` value. `pending_recovery`
+    /// is left at `0` — the shutdown path fills it in after a bounded DB query.
+    pub(crate) fn snapshot(&self) -> Stats {
+        Stats {
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            timed_out: self.timed_out.load(Ordering::Relaxed),
+            mark_timed_out: self.mark_timed_out.load(Ordering::Relaxed),
+            aborted: self.aborted.load(Ordering::Relaxed),
+            fenced_out: self.fenced_out.load(Ordering::Relaxed),
+            pending_recovery: 0,
+        }
+    }
+}
+
+/// Stats snapshot returned by [`WorkerHandle::shutdown`]. All counters are
+/// monotonic since worker start.
+///
+/// Field semantics (PLAN.md §"Shutdown semantics"):
+/// - `completed` — handlers that returned `Ok(())` AND whose `mark_done`
+///   flipped one row (commit observed).
+/// - `failed` — handlers that returned `Err(JobError::Retry|Abort)` OR
+///   panicked, AND whose `mark_retry` / `mark_dead` flipped one row.
+/// - `timed_out` — handlers cancelled via the per-handler `handler_timeout`.
+///   Routed through `mark_retry` with `reason = "handler_timeout"`.
+/// - `mark_timed_out` — `mark_*` SQL itself exceeded `mark_timeout` (pool
+///   pressure). Row left `'running'`; reaper recovers after lease expiry.
+/// - `aborted` — handlers aborted via `JoinSet::abort_all` during
+///   `WorkerHandle::shutdown` (NOT via `handler_timeout`). Row left
+///   `'running'`; reaper recovers.
+/// - `fenced_out` — `mark_*` returned `0 rows_affected` — lease lost to the
+///   reaper or a competing worker. State is consistent under the conflicting
+///   writer.
+/// - `pending_recovery` — rows still in `status = 'running'` for our queue
+///   at the moment `shutdown` returned. Best-effort: if the lookup query
+///   fails or times out (e.g., dead pool), this field reads `0` and a
+///   `tracing::warn!` event is emitted.
+///
+/// Edge case (documented as accepted): a handler whose `mark_done` UPDATE
+/// committed server-side but whose future was cancelled before returning to
+/// the worker → row is `'done'` in the DB but `completed` does NOT count it.
+/// Stats may be off by 1-2 under aggressive shutdown. See PLAN.md
+/// §"Aborted handlers semantics".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Handlers `Ok` AND `mark_done` flipped 1 row.
+    pub completed: u64,
+    /// Handlers `Err(JobError::*)` (or panic-routed) AND `mark_*` flipped 1 row.
+    pub failed: u64,
+    /// Handlers cancelled via `handler_timeout`.
+    pub timed_out: u64,
+    /// `mark_*` SQL exceeded `mark_timeout`.
+    pub mark_timed_out: u64,
+    /// Handlers aborted by `WorkerHandle::shutdown` cascade.
+    pub aborted: u64,
+    /// `mark_*` returned 0 `rows_affected` — lease drift.
+    pub fenced_out: u64,
+    /// Rows still `'running'` for our queue at shutdown return.
+    pub pending_recovery: u64,
 }
 
 /// Handler trait object signature: `Fn(T, JobContext) -> impl Future<Output = Result<(), JobError>>`.
@@ -720,6 +788,7 @@ where
             tasks: Mutex::new(JoinSet::new()),
             stats: AtomicStats::default(),
             last_fatal: OnceLock::new(),
+            last_panic_escalation: OnceLock::new(),
         });
 
         let state_for_loop = state.clone();
@@ -763,17 +832,29 @@ pub(crate) struct WorkerState<T, C> {
     pub(crate) tasks: Mutex<JoinSet<()>>,
     pub(crate) stats: AtomicStats,
     pub(crate) last_fatal: OnceLock<Arc<sqlx::Error>>,
+    /// Set by the reaper once `REAPER_PANIC_ESCALATION_THRESHOLD` consecutive
+    /// panic ticks have fired and shutdown was forced. Used by
+    /// `WorkerHandle::{join, shutdown}` to surface
+    /// `ShutdownError::ReaperPanicEscalation`. `Fatal` takes precedence if
+    /// both are set (e.g., a fatal SQL error landed inside the same loop).
+    pub(crate) last_panic_escalation: OnceLock<u32>,
 }
 
-/// Handle returned by [`Worker::start`]. Faza 4 surface is minimal — `cancel`
-/// + `join`. Faza 7 replaces this with `shutdown(timeout) -> Result<Stats, _>`.
+/// Handle returned by [`Worker::start`].
+///
+/// Two terminal once-only methods are exposed. Both consume `self`, so
+/// double-shutdown is statically prevented (the `ShutdownError::AlreadyShutdown`
+/// variant is reserved for future API revisions).
+///
+/// - [`WorkerHandle::join`] — wait for natural exit (cancel + drain). No
+///   timeout; no Stats. Kept for back-compat with Faza 4 surface.
+/// - [`WorkerHandle::shutdown`] — preferred for production. Bounded shutdown
+///   with hard-abort cascade + best-effort `Stats` snapshot.
 pub struct WorkerHandle {
     state: Arc<dyn WorkerStateOps>,
     poll_join: JoinHandle<()>,
-    #[allow(dead_code)] // retained for Faza 7 hard-abort path
     poll_abort: AbortHandle,
     reaper_join: JoinHandle<()>,
-    #[allow(dead_code)] // retained for Faza 7 hard-abort path
     reaper_abort: AbortHandle,
 }
 
@@ -787,31 +868,25 @@ impl WorkerHandle {
     /// Trigger shutdown signal. Poll loop exits at the next `.await` point
     /// (cancellation is intercepted via `tokio::select!`). Idempotent.
     ///
-    /// Faza 4 minimal — Faza 7 replaces with
-    /// `shutdown(timeout) -> Result<Stats, _>`.
+    /// Pairs with [`WorkerHandle::join`] for the no-timeout, no-Stats path.
+    /// For production, prefer [`WorkerHandle::shutdown`] (atomic
+    /// cancel + bounded drain + Stats).
     pub fn cancel(&self) {
         self.state.cancel_shutdown();
     }
 
     /// Await poll loop + reaper loop completion, then drain in-flight handlers.
     ///
-    /// Drains the local handler `JoinSet` until empty. Returns
-    /// [`ShutdownError::Fatal`] if either the poll loop OR the reaper
-    /// self-shutdown after a fatal sqlx error (see
-    /// [`crate::error::ShutdownError`]).
+    /// Drains the local handler `JoinSet` until empty. Faza 7 adds two
+    /// new error variants:
+    ///   - [`ShutdownError::Fatal`] — fatal `sqlx::Error` in poll or reaper.
+    ///   - [`ShutdownError::ReaperPanicEscalation`] — reaper hit the panic
+    ///     threshold (Faza 5 surface gap is closed here).
     ///
-    /// **Phase 5 surface gap (Phase 7 follow-up):** if the reaper task is
-    /// killed by `K = REAPER_PANIC_ESCALATION_THRESHOLD` (=3) consecutive
-    /// panic ticks, the worker self-shuts but `join()` returns `Ok(())` —
-    /// `last_fatal` is not set because no `sqlx::Error` is available. The
-    /// panic count is surfaced through `tracing::error!` events only.
-    /// Phase 7 (`shutdown(timeout) -> Result<Stats, _>`) will add a
-    /// programmatic surface for this case.
+    /// `Fatal` takes precedence over `ReaperPanicEscalation` if both fire.
     ///
     /// # Errors
-    /// Returns [`ShutdownError::Fatal`] iff the poll loop OR reaper task
-    /// classified a `sqlx::Error` as fatal via `is_fatal_sqlx` before
-    /// exiting.
+    /// See above.
     pub async fn join(self) -> Result<(), ShutdownError> {
         // 1) Await poll loop natural exit (already cancelled or self-shut).
         let _ = self.poll_join.await;
@@ -830,7 +905,106 @@ impl WorkerHandle {
         if let Some(fatal) = self.state.last_fatal_snapshot() {
             return Err(ShutdownError::Fatal(fatal));
         }
+        // 5) Reaper panic escalation — Phase 5 surface gap closure.
+        if let Some(consecutive_panics) = self.state.last_panic_escalation_snapshot() {
+            return Err(ShutdownError::ReaperPanicEscalation { consecutive_panics });
+        }
         Ok(())
+    }
+
+    /// Bounded shutdown — preferred for production. Returns a [`Stats`]
+    /// snapshot covering the worker's lifetime.
+    ///
+    /// Sequence (PLAN.md §"Shutdown semantics"):
+    /// 1. **Soft cancel** — fire the cancellation token. Poll / reaper
+    ///    `select!` branches exit at their next `.await` point.
+    /// 2. **Soft drain (`timeout/2`)** — await poll + reaper `JoinHandle`s.
+    ///    Under normal load both exit in single-digit ms.
+    /// 3. **Hard abort poll / reaper** — `AbortHandle::abort()` defends
+    ///    against a hung SQL future under pool starvation.
+    /// 4. **Handler drain (remaining timeout)** — wait for in-flight
+    ///    handlers to finish naturally up to the deadline.
+    /// 5. **Hard abort handlers** — `JoinSet::abort_all` + short bounded
+    ///    drain (cancellation cascade per Anti-pattern #12). Each in-flight
+    ///    handler at this point is counted in `stats.aborted`.
+    /// 6. **`pending_recovery` count** — `SELECT count(*) WHERE status =
+    ///    'running'` for our queue, under a 500ms timeout (best-effort).
+    /// 7. **Build Stats** + surface terminal errors.
+    ///
+    /// # Errors
+    /// - [`ShutdownError::Fatal`] — fatal `sqlx::Error` in poll or reaper.
+    /// - [`ShutdownError::ReaperPanicEscalation`] — reaper hit the panic
+    ///   threshold.
+    ///
+    /// `Fatal` wins over `ReaperPanicEscalation` if both are set. On the
+    /// happy path Stats is returned even if the soft-drain stage exhausted
+    /// the timeout — Step 5 always completes synchronously after `abort_all`.
+    pub async fn shutdown(self, timeout: Duration) -> Result<Stats, ShutdownError> {
+        // Capture absolute deadline up-front so each phase honors a single
+        // wall-clock budget.
+        let start = tokio::time::Instant::now();
+        let deadline = start + timeout;
+
+        // 1) Soft cancel.
+        self.state.cancel_shutdown();
+
+        // 2) Soft drain (timeout/2) on poll + reaper.
+        let half = timeout / 2;
+        let _ = tokio::time::timeout(half, async {
+            let _ = self.poll_join.await;
+            let _ = self.reaper_join.await;
+        })
+        .await;
+
+        // 3) Hard abort poll + reaper. Cheap idempotent — both ignore the
+        //    abort if the task already exited.
+        self.poll_abort.abort();
+        self.reaper_abort.abort();
+
+        // 4) Handler drain up to overall deadline (may be Instant::now()
+        //    if step 2 burned the whole budget — that's fine; the call
+        //    short-circuits via `timeout_at`).
+        let _drained_clean = self.state.drain_handlers_until(deadline).await;
+
+        // 5) Hard abort remaining handlers — cascade via JoinSet drop +
+        //    abort_all. We attribute each remaining task to `aborted`.
+        //    Cap the post-abort wait at 1s so a non-cooperating handler
+        //    (theoretical: blocking syscall) can't extend shutdown.
+        let _aborted_now = self
+            .state
+            .abort_remaining_handlers(Duration::from_secs(1))
+            .await;
+
+        // 6) pending_recovery — best-effort DB lookup under a small timeout.
+        let pending_recovery = self
+            .state
+            .count_pending_recovery(Duration::from_millis(500))
+            .await;
+
+        // 7) Build Stats + classify terminal errors.
+        let mut stats = self.state.snapshot_stats();
+        stats.pending_recovery = pending_recovery;
+
+        tracing::info!(
+            target: "pgwq.shutdown",
+            completed = stats.completed,
+            failed = stats.failed,
+            timed_out = stats.timed_out,
+            mark_timed_out = stats.mark_timed_out,
+            aborted = stats.aborted,
+            fenced_out = stats.fenced_out,
+            pending_recovery = stats.pending_recovery,
+            elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "worker shutdown complete"
+        );
+
+        if let Some(fatal) = self.state.last_fatal_snapshot() {
+            return Err(ShutdownError::Fatal(fatal));
+        }
+        if let Some(consecutive_panics) = self.state.last_panic_escalation_snapshot() {
+            return Err(ShutdownError::ReaperPanicEscalation { consecutive_panics });
+        }
+        Ok(stats)
     }
 }
 
@@ -839,7 +1013,35 @@ impl WorkerHandle {
 trait WorkerStateOps: Send + Sync {
     fn cancel_shutdown(&self);
     fn last_fatal_snapshot(&self) -> Option<Arc<sqlx::Error>>;
+    fn last_panic_escalation_snapshot(&self) -> Option<u32>;
     fn drain_handlers<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    /// Drain `state.tasks` `JoinSet` via `tokio::time::timeout_at(deadline, _)`,
+    /// returning `true` if the `JoinSet` was fully drained before the deadline
+    /// fired. Each successfully drained handler is already handled inside
+    /// `handle_job` (panic / cancel branches) so no per-task counting is done
+    /// here.
+    fn drain_handlers_until<'a>(
+        &'a self,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+    /// Bump `aborted` by the remaining in-flight handler count, then
+    /// `abort_all` and drain (each abort-cancelled task is one already
+    /// counted). Returns the number of aborts attributed.
+    fn abort_remaining_handlers<'a>(
+        &'a self,
+        grace: Duration,
+    ) -> Pin<Box<dyn Future<Output = u64> + Send + 'a>>;
+    /// Snapshot the running counters into a `Stats`. `pending_recovery` is
+    /// left at `0` — the caller fills it in via [`Self::count_pending_recovery`].
+    fn snapshot_stats(&self) -> Stats;
+    /// Count rows still in `status = 'running'` for our queue at this moment.
+    /// Wrapped in `tokio::time::timeout(query_timeout, _)` so a dead pool can
+    /// not extend shutdown indefinitely. On error / timeout returns `Ok(0)`
+    /// and logs a warn — Stats is best-effort per PLAN.md §"Shutdown semantics".
+    fn count_pending_recovery<'a>(
+        &'a self,
+        query_timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = u64> + Send + 'a>>;
 }
 
 impl<T, C> WorkerStateOps for WorkerState<T, C>
@@ -855,6 +1057,10 @@ where
         self.last_fatal.get().cloned()
     }
 
+    fn last_panic_escalation_snapshot(&self) -> Option<u32> {
+        self.last_panic_escalation.get().copied()
+    }
+
     fn drain_handlers<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             // Drain JoinSet until empty. We hold the Mutex across awaits —
@@ -864,6 +1070,120 @@ where
             while let Some(_res) = guard.join_next().await {
                 // Per-task panic/cancel already handled inside handle_job
                 // (panics caught via JoinError::is_panic in the inner JoinSet).
+            }
+        })
+    }
+
+    fn drain_handlers_until<'a>(
+        &'a self,
+        deadline: tokio::time::Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let mut guard = self.tasks.lock().await;
+            loop {
+                if guard.is_empty() {
+                    return true;
+                }
+                match tokio::time::timeout_at(deadline, guard.join_next()).await {
+                    Ok(Some(_res)) => continue,
+                    // JoinSet returned None — set is empty.
+                    Ok(None) => return true,
+                    Err(_elapsed) => return false,
+                }
+            }
+        })
+    }
+
+    fn abort_remaining_handlers<'a>(
+        &'a self,
+        grace: Duration,
+    ) -> Pin<Box<dyn Future<Output = u64> + Send + 'a>> {
+        Box::pin(async move {
+            let mut guard = self.tasks.lock().await;
+            if guard.is_empty() {
+                return 0;
+            }
+            // First, opportunistically drain any handlers that finished BETWEEN
+            // the soft-drain's deadline elapse and now (mutex was released
+            // briefly during the deadline check). These already-finished tasks
+            // updated their own `completed`/`failed`/etc. counters and must
+            // NOT be folded into `aborted` (double-count race; reviewer I1).
+            // try_join_next() is non-blocking: it returns ready completions
+            // without yielding to a not-yet-finished task.
+            while guard.try_join_next().is_some() {}
+            // Now the remaining set is exactly the in-flight tasks. abort_all
+            // them and count cancelled outcomes during the bounded drain.
+            let still_pending_before_abort = guard.len() as u64;
+            if still_pending_before_abort == 0 {
+                return 0;
+            }
+            guard.abort_all();
+            let mut aborted_count: u64 = 0;
+            let grace_deadline = tokio::time::Instant::now() + grace;
+            loop {
+                if guard.is_empty() {
+                    break;
+                }
+                match tokio::time::timeout_at(grace_deadline, guard.join_next()).await {
+                    Ok(Some(Err(je))) if je.is_cancelled() => {
+                        aborted_count = aborted_count.saturating_add(1);
+                    }
+                    // Other outcomes (panic, or rare Ok — task happened to
+                    // finish exactly when abort fired): NOT counted as
+                    // aborted. Their per-handler completion path already
+                    // bumped the appropriate counter (panic → routed via
+                    // PanicPolicy; Ok → completed via flip_done_state).
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            if aborted_count > 0 {
+                self.stats
+                    .aborted
+                    .fetch_add(aborted_count, Ordering::Relaxed);
+            }
+            aborted_count
+        })
+    }
+
+    fn snapshot_stats(&self) -> Stats {
+        self.stats.snapshot()
+    }
+
+    fn count_pending_recovery<'a>(
+        &'a self,
+        query_timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = u64> + Send + 'a>> {
+        Box::pin(async move {
+            let q = sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pgwq.jobs WHERE queue = $1 AND status = 'running'",
+            )
+            .bind(&self.queue)
+            .fetch_one(&self.pool);
+            match tokio::time::timeout(query_timeout, q).await {
+                Ok(Ok(n)) => u64::try_from(n).unwrap_or(0),
+                Ok(Err(e)) => {
+                    tracing::event!(
+                        target: "pgwq.shutdown.pending_recovery_failed",
+                        tracing::Level::WARN,
+                        worker.id = %self.worker_id,
+                        queue = %self.queue,
+                        error = %e,
+                        "pending_recovery query failed; reporting 0 (best-effort)"
+                    );
+                    0
+                }
+                Err(_elapsed) => {
+                    tracing::event!(
+                        target: "pgwq.shutdown.pending_recovery_timed_out",
+                        tracing::Level::WARN,
+                        worker.id = %self.worker_id,
+                        queue = %self.queue,
+                        timeout_ms = u64::try_from(query_timeout.as_millis()).unwrap_or(u64::MAX),
+                        "pending_recovery query timed out; reporting 0 (best-effort)"
+                    );
+                    0
+                }
             }
         })
     }

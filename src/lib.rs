@@ -28,11 +28,10 @@ pub use crate::error::{BuildError, JobError, PushError, ShutdownError, StartErro
 pub use crate::job::{Job, JobContext};
 pub use crate::migrator::migrator;
 pub use crate::pusher::Pusher;
-pub use crate::worker::{TickStats, Worker, WorkerBuilder, WorkerHandle};
+pub use crate::worker::{Stats, TickStats, Worker, WorkerBuilder, WorkerHandle};
 
 // pub use crate::error::PurgeError;                                         // (Faza 8)
 // pub use crate::purge::{purge_dead, purge_done, queue_stats, QueueStats};  // (Faza 8)
-// pub use crate::worker::Stats;                                             // (Faza 7)
 
 /// Hidden re-exports used by integration tests under `tests/`. NOT part of
 /// the public API; may change or vanish at any time.

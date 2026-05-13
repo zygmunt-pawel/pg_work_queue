@@ -264,11 +264,18 @@ where
                     "reaper tick panicked"
                 );
                 if consecutive_panics >= REAPER_PANIC_ESCALATION_THRESHOLD {
-                    tracing::error!(
+                    tracing::event!(
+                        target: "pgwq.reaper.escalation",
+                        tracing::Level::ERROR,
                         worker.id = %state.worker_id,
                         threshold = REAPER_PANIC_ESCALATION_THRESHOLD,
+                        consecutive_panics,
                         "reaper exceeded panic threshold; shutting down worker"
                     );
+                    // Surface programmatically via WorkerHandle::shutdown /
+                    // join → ShutdownError::ReaperPanicEscalation. First
+                    // escalation wins; set is idempotent.
+                    let _ = state.last_panic_escalation.set(consecutive_panics);
                     state.shutdown.cancel();
                     return;
                 }

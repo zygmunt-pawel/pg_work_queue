@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use pg_work_queue::__test_exports::REAPER_PANIC_INJECTIONS;
-use pg_work_queue::{JobContext, JobError, Worker};
+use pg_work_queue::{JobContext, JobError, ShutdownError, Worker};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 struct Payload {
@@ -59,15 +59,19 @@ async fn three_consecutive_reaper_panics_trigger_self_shutdown() {
         join_result.is_ok(),
         "WorkerHandle::join() must complete within 8s after reaper panic escalation"
     );
-    // join() itself returns Ok(()) — panic threshold cancels shutdown but
-    // does NOT set last_fatal (no sqlx::Error available). Faza 7 may
-    // surface this through a dedicated `ShutdownError::ReaperPanicEscalation`
-    // variant; for now operators detect it via tracing::error.
+    // Faza 7 surface: `join()` propagates `ShutdownError::ReaperPanicEscalation`
+    // carrying the consecutive-panic count. Earlier (Faza 5) this returned
+    // `Ok(())` and operators had to read tracing events.
     let inner = join_result.expect("join completed in time");
-    assert!(
-        inner.is_ok(),
-        "join() must return Ok — panic escalation triggers a clean shutdown, not Fatal"
-    );
+    match inner {
+        Err(ShutdownError::ReaperPanicEscalation { consecutive_panics }) => {
+            assert_eq!(
+                consecutive_panics, 3,
+                "expected exactly 3 consecutive panics surfaced (got {consecutive_panics})"
+            );
+        }
+        other => panic!("expected ShutdownError::ReaperPanicEscalation, got {other:?}"),
+    }
 
     // All 3 injections must have been consumed by the reaper before
     // escalation fired — otherwise either the test hook is broken or the
