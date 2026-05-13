@@ -1048,21 +1048,35 @@ A short rationale for each shape of the public API.
 `pg_work_queue::migrator()` uses `sqlx::migrate!()` which (in `sqlx`
 `0.8.x`) hard-codes the migration tracking table to `_sqlx_migrations`.
 If your application also runs `sqlx::migrate!()` against the same
-database, `version` collisions are a matter of time — both migrators
-write to the same table and treat each other's rows as "missing
-migrations".
+database, every migrator writes into that one shared table.
 
-Workarounds for v0.1:
+The crate's `migrator()` calls `set_ignore_missing(true)`, so it does
+**not** error when it encounters migration rows it didn't apply
+(yours, or another library's). Net effect: two co-existing migrators
+each run only their own SQL and silently ignore each other's rows in
+`_sqlx_migrations` — no manual workaround needed for the common case.
+
+Two caveats remain:
+
+- **Unique migration `version` numbers across migrators.** The filename
+  prefix is parsed as the integer `version`. If your application
+  defines a migration whose prefix collides with one of ours
+  (currently only `20260513000000_v01_init.sql`), the insert into
+  `_sqlx_migrations` will fail on the primary-key constraint. Use
+  fresh timestamps for your own migrations and you're safe.
+- **No table-name namespacing yet.** All migrators still touch
+  `_sqlx_migrations`. The cleaner fix —
+  `sqlx::migrate::Migrator::dangerous_set_table_name` to namespace to
+  `_pgwq_migrations` — only landed on the `sqlx` `0.9` line; the
+  pinned `0.8.6` here predates it. The crate will switch to a private
+  table once `0.9` reaches stable.
+
+Defensive escape hatches if either caveat bites:
 
 - Apply this crate's migrations against a database that is **not**
   shared with your application's own sqlx-managed schema, or
 - Run the embedded migration SQL yourself via your own migration
   tooling, skipping `pg_work_queue::migrator()`.
-
-`sqlx::migrate::Migrator::dangerous_set_table_name` (which would let us
-namespace the table to `_pgwq_migrations`) is only available on the
-`sqlx` `0.9` line — the pinned `0.8.6` here predates it. The fix lands
-once `sqlx 0.9` reaches a stable release.
 
 ### Painful by design (not bugs, accepted trade-offs)
 

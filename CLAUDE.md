@@ -138,10 +138,14 @@ navigating the code.
 ## Known constraint to keep in mind
 
 `sqlx::migrate!()` on `0.8.x` hard-codes the migration tracking table
-to `_sqlx_migrations`. If you co-locate this crate's migrations with an
-application using its own `sqlx::migrate!()`, the two will collide on
-version numbers. The fix waits on `sqlx 0.9`'s
-`dangerous_set_table_name`. See README "Known limitations".
+to `_sqlx_migrations`. The crate's `migrator()` mitigates the
+multi-migrator coexistence case by calling `set_ignore_missing(true)`,
+so it doesn't choke on migration rows other libraries (or your app)
+inserted. Two caveats remain: each migration's filename `version`
+prefix must be unique across all migrators sharing the DB (we own
+`20260513000000`), and the table itself is still shared (no
+namespacing until `sqlx 0.9`'s `dangerous_set_table_name`). See
+README "Known limitations" for the user-facing version.
 
 ## Reference docs in this repo
 
