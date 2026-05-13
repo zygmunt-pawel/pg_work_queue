@@ -380,12 +380,12 @@ async fn backoff_invalid_factor_rejected() {
     // factor must be > 1.0; 1.0 is rejected.
     let res = Worker::<Payload, _>::builder()
         .queue("ok_q")
-        .retry_backoff(BackoffPolicy::exponential(
-            Duration::from_secs(1),
-            1.0,
-            Duration::from_secs(60),
-            0.0,
-        ))
+        .retry_backoff(BackoffPolicy::Exponential {
+            base: Duration::from_secs(1),
+            factor: 1.0,
+            cap: Duration::from_secs(60),
+            jitter: 0.0,
+        })
         .pool(dummy_pool())
         .handler(handler_ok())
         .build();
@@ -401,12 +401,12 @@ async fn backoff_invalid_factor_rejected() {
 async fn backoff_invalid_jitter_rejected() {
     let res = Worker::<Payload, _>::builder()
         .queue("ok_q")
-        .retry_backoff(BackoffPolicy::exponential(
-            Duration::from_secs(1),
-            2.0,
-            Duration::from_secs(60),
-            1.5, // > 1.0
-        ))
+        .retry_backoff(BackoffPolicy::Exponential {
+            base: Duration::from_secs(1),
+            factor: 2.0,
+            cap: Duration::from_secs(60),
+            jitter: 1.5, // > 1.0
+        })
         .pool(dummy_pool())
         .handler(handler_ok())
         .build();
@@ -439,12 +439,12 @@ async fn backoff_invalid_cap_too_large_rejected() {
     // cap > 24h.
     let res = Worker::<Payload, _>::builder()
         .queue("ok_q")
-        .retry_backoff(BackoffPolicy::exponential(
-            Duration::from_secs(1),
-            2.0,
-            Duration::from_secs(25 * 3600),
-            0.0,
-        ))
+        .retry_backoff(BackoffPolicy::Exponential {
+            base: Duration::from_secs(1),
+            factor: 2.0,
+            cap: Duration::from_secs(25 * 3600),
+            jitter: 0.0,
+        })
         .pool(dummy_pool())
         .handler(handler_ok())
         .build();
@@ -460,11 +460,11 @@ async fn backoff_invalid_cap_too_large_rejected() {
 async fn backoff_invalid_cap_zero_rejected() {
     let res = Worker::<Payload, _>::builder()
         .queue("ok_q")
-        .retry_backoff(BackoffPolicy::linear(
-            Duration::from_millis(100),
-            Duration::ZERO,
-            Duration::ZERO,
-        ))
+        .retry_backoff(BackoffPolicy::Linear {
+            base: Duration::from_millis(100),
+            increment: Duration::ZERO,
+            cap: Duration::ZERO,
+        })
         .pool(dummy_pool())
         .handler(handler_ok())
         .build();

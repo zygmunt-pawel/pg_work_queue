@@ -48,12 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_attempts(5)
         .lease_timeout(Duration::from_secs(300))
         .handler_timeout(Duration::from_secs(240)) // 80% of lease (default)
-        .retry_backoff(BackoffPolicy::exponential(
-            Duration::from_secs(1), // base
-            2.0,                    // factor
-            Duration::from_secs(5 * 60), // cap
-            0.2,                    // ±20% jitter
-        ))
+        .retry_backoff(BackoffPolicy::Exponential {
+            base: Duration::from_secs(1),
+            factor: 2.0,
+            cap: Duration::from_secs(5 * 60),
+            jitter: 0.2, // ±20%
+        })
         .handler(|task: EmailTask, ctx: JobContext| async move {
             // ctx.idempotency_key is STABLE across retries — use it for
             // any external API that supports Idempotency-Key headers.

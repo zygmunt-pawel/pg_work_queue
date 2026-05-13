@@ -49,23 +49,26 @@ const MAX_BACKOFF_CAP: Duration = Duration::from_secs(24 * 3600);
 /// # Examples
 ///
 /// ```ignore
+/// use std::time::Duration;
+/// use pg_work_queue::BackoffPolicy;
+///
 /// // Fixed 2s delay between retries.
-/// let fixed = pg_work_queue::BackoffPolicy::fixed(std::time::Duration::from_secs(2));
+/// let fixed = BackoffPolicy::fixed(Duration::from_secs(2));
 ///
 /// // Linear: 1s, 2s, 3s, ..., capped at 30s.
-/// let linear = pg_work_queue::BackoffPolicy::linear(
-///     std::time::Duration::from_secs(1),
-///     std::time::Duration::from_secs(1),
-///     std::time::Duration::from_secs(30),
-/// );
+/// let linear = BackoffPolicy::Linear {
+///     base: Duration::from_secs(1),
+///     increment: Duration::from_secs(1),
+///     cap: Duration::from_secs(30),
+/// };
 ///
 /// // Exponential: 1s, 2s, 4s, 8s, ..., capped at 5min, ±20% jitter.
-/// let exp = pg_work_queue::BackoffPolicy::exponential(
-///     std::time::Duration::from_secs(1),
-///     2.0,
-///     std::time::Duration::from_secs(300),
-///     0.2,
-/// );
+/// let exp = BackoffPolicy::Exponential {
+///     base: Duration::from_secs(1),
+///     factor: 2.0,
+///     cap: Duration::from_secs(300),
+///     jitter: 0.2,
+/// };
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub enum BackoffPolicy {
@@ -108,28 +111,6 @@ impl Default for BackoffPolicy {
 }
 
 impl BackoffPolicy {
-    /// Construct an `Exponential` policy with the supplied parameters.
-    /// The builder validates parameters internally on `build()`.
-    #[must_use]
-    pub const fn exponential(base: Duration, factor: f64, cap: Duration, jitter: f64) -> Self {
-        Self::Exponential {
-            base,
-            factor,
-            cap,
-            jitter,
-        }
-    }
-
-    /// Construct a `Linear` policy.
-    #[must_use]
-    pub const fn linear(base: Duration, increment: Duration, cap: Duration) -> Self {
-        Self::Linear {
-            base,
-            increment,
-            cap,
-        }
-    }
-
     /// Construct a fixed-delay policy: every retry waits exactly `d`. Implemented
     /// as `Linear { base: d, increment: 0, cap: d }` so there is no separate
     /// `Fixed` variant.

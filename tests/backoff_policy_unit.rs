@@ -31,11 +31,11 @@ fn fixed_returns_constant_regardless_of_attempt() {
 #[test]
 fn linear_arithmetic_progression_and_cap() {
     // base=1s, increment=1s, cap=10s
-    let p = BackoffPolicy::linear(
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::from_secs(10),
-    );
+    let p = BackoffPolicy::Linear {
+        base: Duration::from_secs(1),
+        increment: Duration::from_secs(1),
+        cap: Duration::from_secs(10),
+    };
     assert_eq!(p.next(0), Duration::from_secs(1));
     assert_eq!(p.next(1), Duration::from_secs(2));
     assert_eq!(p.next(5), Duration::from_secs(6));
@@ -48,7 +48,12 @@ fn linear_arithmetic_progression_and_cap() {
 #[test]
 fn exponential_no_jitter_geometric_progression_and_cap() {
     // base=1s, factor=2.0, cap=30s, jitter=0.0
-    let p = BackoffPolicy::exponential(Duration::from_secs(1), 2.0, Duration::from_secs(30), 0.0);
+    let p = BackoffPolicy::Exponential {
+        base: Duration::from_secs(1),
+        factor: 2.0,
+        cap: Duration::from_secs(30),
+        jitter: 0.0,
+    };
     assert_eq!(p.next(0), Duration::from_secs(1));
     assert_eq!(p.next(1), Duration::from_secs(2));
     assert_eq!(p.next(2), Duration::from_secs(4));
@@ -62,7 +67,12 @@ fn exponential_no_jitter_geometric_progression_and_cap() {
 #[test]
 fn exponential_with_jitter_stays_in_band_and_under_cap() {
     // base=1s, factor=2.0, cap=10s, jitter=0.5 (±50%).
-    let p = BackoffPolicy::exponential(Duration::from_secs(1), 2.0, Duration::from_secs(10), 0.5);
+    let p = BackoffPolicy::Exponential {
+        base: Duration::from_secs(1),
+        factor: 2.0,
+        cap: Duration::from_secs(10),
+        jitter: 0.5,
+    };
     // attempt=2 → raw = 4s; jittered ∈ [2s, 6s]. Loop 100× by zobaczyć
     // distribution (deterministic test → assert band, nie konkretna wartość).
     for _ in 0..100 {
@@ -105,7 +115,12 @@ fn exponential_default_constants() {
 
 #[test]
 fn cap_invariant_holds_for_all_attempts() {
-    let p = BackoffPolicy::exponential(Duration::from_secs(1), 2.0, Duration::from_secs(60), 0.3);
+    let p = BackoffPolicy::Exponential {
+        base: Duration::from_secs(1),
+        factor: 2.0,
+        cap: Duration::from_secs(60),
+        jitter: 0.3,
+    };
     let cap = Duration::from_secs(60);
     for attempt in [0_u32, 1, 5, 20, 100, 10_000] {
         for _ in 0..10 {

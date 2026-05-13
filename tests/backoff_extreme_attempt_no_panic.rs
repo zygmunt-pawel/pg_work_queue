@@ -21,12 +21,12 @@ use pg_work_queue::BackoffPolicy;
 
 #[test]
 fn next_400_with_factor_10_returns_cap_no_panic() {
-    let p = BackoffPolicy::exponential(
-        Duration::from_secs(1),
-        10.0,
-        Duration::from_secs(24 * 3600),
-        0.0,
-    );
+    let p = BackoffPolicy::Exponential {
+        base: Duration::from_secs(1),
+        factor: 10.0,
+        cap: Duration::from_secs(24 * 3600),
+        jitter: 0.0,
+    };
     let d = p.next(400);
     assert_eq!(
         d,
@@ -37,12 +37,12 @@ fn next_400_with_factor_10_returns_cap_no_panic() {
 
 #[test]
 fn next_u32_max_returns_cap_no_panic() {
-    let p = BackoffPolicy::exponential(
-        Duration::from_secs(1),
-        10.0,
-        Duration::from_secs(24 * 3600),
-        0.0,
-    );
+    let p = BackoffPolicy::Exponential {
+        base: Duration::from_secs(1),
+        factor: 10.0,
+        cap: Duration::from_secs(24 * 3600),
+        jitter: 0.0,
+    };
     let d = p.next(u32::MAX);
     assert_eq!(
         d,
@@ -53,12 +53,12 @@ fn next_u32_max_returns_cap_no_panic() {
 
 #[test]
 fn next_extreme_with_jitter_no_panic_still_capped() {
-    let p = BackoffPolicy::exponential(
-        Duration::from_secs(1),
-        10.0,
-        Duration::from_secs(24 * 3600),
-        0.2,
-    );
+    let p = BackoffPolicy::Exponential {
+        base: Duration::from_secs(1),
+        factor: 10.0,
+        cap: Duration::from_secs(24 * 3600),
+        jitter: 0.2,
+    };
     // Jitter ratio ≤ 1.0 → post-jitter ≤ 2× cap; library re-clamps po jitterze.
     let d = p.next(u32::MAX);
     assert!(
