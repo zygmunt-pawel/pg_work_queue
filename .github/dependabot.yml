@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # Keep workflow action versions current. Pure-win automation: GH
+  # Actions versions get security patches, this just opens PRs.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '07:00'
+      timezone: Europe/Warsaw
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: ci
+      include: scope
+
+  # `cargo` ecosystem is intentionally NOT enabled here. Cargo.toml uses
+  # exact-version pins (`=0.8.6`, `=1.52.3`, …) — see the rationale in
+  # CLAUDE.md and the Cargo.toml comment block. Dependabot would either
+  # flood the repo with `=` bump PRs or be unable to act with
+  # `versioning-strategy: lockfile-only` (lockfile is fully constrained
+  # by the `=` pins). Vulnerability surveillance for Rust deps is handled
+  # by the daily cargo-deny advisories check in `.github/workflows/audit.yml`.

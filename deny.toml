@@ -1,0 +1,83 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+#
+# Run locally:
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# CI runs the same via .github/workflows/audit.yml on every PR + daily cron.
+
+[graph]
+# Build the dep graph for the host target only — same as `cargo build`
+# defaults. If we ever cross-compile (we don't today), add targets here.
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ------------------------------------------------------------------- #
+# Advisories — RustSec database (https://rustsec.org)                  #
+# ------------------------------------------------------------------- #
+[advisories]
+version = 2
+# Crates whose advisories we explicitly accept (with reason). Empty by
+# default; populate as `{ id = "RUSTSEC-XXXX-XXXX", reason = "…" }`
+# when a transitive dep can't yet be upgraded but the advisory doesn't
+# affect our usage. Every entry MUST include a reason.
+ignore = []
+# Yanked crates aren't necessarily insecure, but they ARE a maintenance
+# smell — surface them.
+yanked = "warn"
+
+# ------------------------------------------------------------------- #
+# Licenses — allow only OSI-approved permissive + MPL                  #
+# ------------------------------------------------------------------- #
+[licenses]
+version = 2
+# Conservative allowlist. If a transitive dep introduces a license not
+# on this list, cargo-deny will fail and force a conscious decision.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "Zlib",
+    "CC0-1.0",
+]
+confidence-threshold = 0.93
+# Per-crate license overrides — empty by default; add only when a crate's
+# license is unambiguous but cargo-deny can't auto-detect it.
+exceptions = []
+
+# ------------------------------------------------------------------- #
+# Bans — duplicates, wildcards, specific crates                        #
+# ------------------------------------------------------------------- #
+[bans]
+# Multiple versions of the same crate inflate compile time and binary
+# size. Warn (not deny) — sometimes unavoidable in transitive trees.
+multiple-versions = "warn"
+# Cargo.toml uses exact `=` pins everywhere (see CLAUDE.md), so wildcards
+# should never appear. Hard-deny to catch accidental loosening.
+wildcards = "deny"
+# Crate-level allow/deny lists — empty until we hit a real case. Pattern:
+# `{ name = "openssl", reason = "…" }`.
+deny = []
+allow = []
+# `multiple-versions = warn` would trip on standard duplicates from the
+# Rust ecosystem (e.g. `syn 1.x` vs `syn 2.x`). We don't whitelist
+# specific dupes here — operator reads the warning and decides.
+skip = []
+skip-tree = []
+
+# ------------------------------------------------------------------- #
+# Sources — only crates.io (no git deps, no private registries)        #
+# ------------------------------------------------------------------- #
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

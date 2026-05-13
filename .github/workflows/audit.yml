@@ -1,0 +1,42 @@
+name: Security audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  # Daily refresh — picks up newly-published RustSec advisories even
+  # when the codebase hasn't moved. 06:13 UTC = off-peak, off any
+  # round-hour spike on shared GH-hosted runners.
+  schedule:
+    - cron: '13 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Runs `cargo deny check` against `deny.toml`. Default scope:
+      # advisories, bans, licenses, sources. Each can be tuned in
+      # `deny.toml`.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # Surface RustSec advisories explicitly even when no PR
+          # touches Cargo.* — the daily cron is the main vehicle.
+          arguments: --all-features
