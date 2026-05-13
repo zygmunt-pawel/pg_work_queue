@@ -133,8 +133,11 @@ impl From<sqlx::Error> for PushError {
 pub enum JobError {
     /// Job miał transient issue — library decyduje retry-vs-dead na
     /// bazie `attempts < max_attempts`. Optional `retry_in` override
-    /// backoff policy dla tego konkretnego retry. W Fazie 3 backoff
-    /// jest stałą (`default_retry_delay`); per-job `retry_in` ma priorytet.
+    /// backoff policy dla tego konkretnego retry. Backoff policy
+    /// (`WorkerBuilder::retry_backoff`, default
+    /// `BackoffPolicy::Exponential`) decyduje delay gdy `retry_in == None`;
+    /// per-job `retry_in` ma priorytet (clampowany do
+    /// `[max(poll_interval, 100ms), 24h]`).
     #[error("retry: {reason}")]
     Retry {
         /// Operator-visible category for the retry (do NOT include PII).
@@ -154,7 +157,8 @@ pub enum JobError {
 
 impl JobError {
     /// Construct a `Retry` variant with no explicit delay; library applies
-    /// `default_retry_delay` from the worker builder.
+    /// the worker's configured `BackoffPolicy` (via
+    /// `WorkerBuilder::retry_backoff`).
     pub fn retry(reason: impl Into<String>) -> Self {
         Self::Retry {
             reason: reason.into(),
@@ -315,6 +319,15 @@ pub enum BuildError {
     LeaseTimeoutTooShortForReaper {
         /// Configured `lease_timeout`.
         lease: Duration,
+    },
+
+    /// `BackoffPolicy` parameters fail [`BackoffPolicy::validate`] —
+    /// `factor`/`jitter`/`base`/`cap` out of supported ranges. See
+    /// [`crate::backoff::BackoffPolicy`] for the contract.
+    #[error("backoff policy invalid: {reason}")]
+    BackoffInvalid {
+        /// Static reason describing which constraint was violated.
+        reason: &'static str,
     },
 }
 

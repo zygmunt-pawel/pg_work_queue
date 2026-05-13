@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 
-use pg_work_queue::{BuildError, JobContext, JobError, Worker};
+use pg_work_queue::{BackoffPolicy, BuildError, JobContext, JobError, Worker};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 struct Payload {
@@ -370,6 +370,109 @@ async fn lease_timeout_too_short_for_reaper_rejected() {
             assert_eq!(lease, Duration::from_millis(1500));
         }
         other => panic!("expected LeaseTimeoutTooShortForReaper, got {other:?}"),
+    }
+}
+
+// ---- Faza 6 BuildError variants (BackoffPolicy) ------------------------
+
+#[tokio::test]
+async fn backoff_invalid_factor_rejected() {
+    // factor must be > 1.0; 1.0 is rejected.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .retry_backoff(BackoffPolicy::exponential(
+            Duration::from_secs(1),
+            1.0,
+            Duration::from_secs(60),
+            0.0,
+        ))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::BackoffInvalid { reason }) => {
+            assert!(reason.contains("factor"), "reason = {reason}");
+        }
+        other => panic!("expected BackoffInvalid (factor), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backoff_invalid_jitter_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .retry_backoff(BackoffPolicy::exponential(
+            Duration::from_secs(1),
+            2.0,
+            Duration::from_secs(60),
+            1.5, // > 1.0
+        ))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::BackoffInvalid { reason }) => {
+            assert!(reason.contains("jitter"), "reason = {reason}");
+        }
+        other => panic!("expected BackoffInvalid (jitter), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backoff_invalid_base_below_floor_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .retry_backoff(BackoffPolicy::fixed(Duration::from_millis(10)))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::BackoffInvalid { reason }) => {
+            assert!(reason.contains("base"), "reason = {reason}");
+        }
+        other => panic!("expected BackoffInvalid (base), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backoff_invalid_cap_too_large_rejected() {
+    // cap > 24h.
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .retry_backoff(BackoffPolicy::exponential(
+            Duration::from_secs(1),
+            2.0,
+            Duration::from_secs(25 * 3600),
+            0.0,
+        ))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::BackoffInvalid { reason }) => {
+            assert!(reason.contains("cap"), "reason = {reason}");
+        }
+        other => panic!("expected BackoffInvalid (cap), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn backoff_invalid_cap_zero_rejected() {
+    let res = Worker::<Payload, _>::builder()
+        .queue("ok_q")
+        .retry_backoff(BackoffPolicy::linear(
+            Duration::from_millis(100),
+            Duration::ZERO,
+            Duration::ZERO,
+        ))
+        .pool(dummy_pool())
+        .handler(handler_ok())
+        .build();
+    match res {
+        Err(BuildError::BackoffInvalid { reason }) => {
+            assert!(reason.contains("cap"), "reason = {reason}");
+        }
+        other => panic!("expected BackoffInvalid (cap zero), got {other:?}"),
     }
 }
 

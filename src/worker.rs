@@ -44,6 +44,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::backoff::{BackoffPolicy, PanicPolicy};
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{BuildError, JobError, ShutdownError, StartError};
 use crate::job::{Job, JobContext};
@@ -53,15 +54,21 @@ use crate::reaper::MIN_REAPER_INTERVAL;
 use crate::transition::{TransitionCtx, TransitionSource, WorkerIdentity, emit_transition};
 use crate::util::fmt_err_trimmed;
 
+/// Hard floor for `retry_in` (handler-supplied per-call override). Below this
+/// a tight retry loop (`retry_in: Duration::ZERO`) hammer'uje DB. Per PLAN.md
+/// §"Retry backoff policy" (lines 1331-1336): `[max(poll_interval, 100ms), 24h]`.
+const MIN_RETRY_IN: Duration = Duration::from_millis(100);
+
+/// Hard ceiling for `retry_in` (handler-supplied per-call override) — same as
+/// the `BackoffPolicy::cap` ceiling. Larger values usually indicate user bug.
+const MAX_RETRY_IN: Duration = Duration::from_secs(24 * 3600);
+
 /// Minimum `lease_timeout`. Below this the handler cannot reliably finish
 /// trivial work + `mark_*` commit before the reaper claws back the row.
 const MIN_LEASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default `lease_timeout` when builder doesn't override.
 const DEFAULT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Default `default_retry_delay` when builder doesn't override.
-const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Default `max_attempts` (1-indexed; 3 attempts total).
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -151,7 +158,8 @@ pub struct WorkerBuilder<T, C = JsonCodec, H = ()> {
     max_attempts: u32,
     lease_timeout: Duration,
     batch_size: u32,
-    default_retry_delay: Duration,
+    retry_backoff: Option<BackoffPolicy>,
+    panic_policy: PanicPolicy,
     poll_interval: Duration,
     concurrency: Option<usize>,
     handler_timeout: Option<Duration>,
@@ -171,7 +179,8 @@ impl<T> WorkerBuilder<T, JsonCodec, ()> {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             lease_timeout: DEFAULT_LEASE_TIMEOUT,
             batch_size: DEFAULT_BATCH_SIZE,
-            default_retry_delay: DEFAULT_RETRY_DELAY,
+            retry_backoff: None,
+            panic_policy: PanicPolicy::default(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             concurrency: None,
             handler_timeout: None,
@@ -220,11 +229,24 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
         self
     }
 
-    /// Set the default retry delay used when a `JobError::Retry` carries no
-    /// `retry_in`. Default: 1s. Faza 6 introduces full `BackoffPolicy`.
+    /// Set the retry backoff policy used when a `JobError::Retry` carries
+    /// no `retry_in` override. Default: [`BackoffPolicy::default()`] —
+    /// `Exponential { 1s, 2.0, 5min, 0.2 }`.
+    ///
+    /// Validate'd przez `build()` (`BuildError::BackoffInvalid` na
+    /// nieprawidłowe params).
     #[must_use]
-    pub const fn default_retry_delay(mut self, d: Duration) -> Self {
-        self.default_retry_delay = d;
+    pub const fn retry_backoff(mut self, policy: BackoffPolicy) -> Self {
+        self.retry_backoff = Some(policy);
+        self
+    }
+
+    /// Set the panic policy: `Retry` (synthesize a `JobError::Retry` and
+    /// route through backoff) or `Dead` (bypass retry budget, `mark_dead`
+    /// immediately). Default: [`PanicPolicy::Retry`].
+    #[must_use]
+    pub const fn panic_policy(mut self, policy: PanicPolicy) -> Self {
+        self.panic_policy = policy;
         self
     }
 
@@ -279,7 +301,8 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
             max_attempts: self.max_attempts,
             lease_timeout: self.lease_timeout,
             batch_size: self.batch_size,
-            default_retry_delay: self.default_retry_delay,
+            retry_backoff: self.retry_backoff,
+            panic_policy: self.panic_policy,
             poll_interval: self.poll_interval,
             concurrency: self.concurrency,
             handler_timeout: self.handler_timeout,
@@ -310,7 +333,8 @@ where
             max_attempts: self.max_attempts,
             lease_timeout: self.lease_timeout,
             batch_size: self.batch_size,
-            default_retry_delay: self.default_retry_delay,
+            retry_backoff: self.retry_backoff,
+            panic_policy: self.panic_policy,
             poll_interval: self.poll_interval,
             concurrency: self.concurrency,
             handler_timeout: self.handler_timeout,
@@ -464,13 +488,20 @@ where
             });
         }
 
+        // Backoff policy: validate user-supplied policy or fall back to the
+        // library default (already valid). Default is never invalid — but call
+        // `validate()` for safety in case someone changes the default impl.
+        let retry_backoff = self.retry_backoff.unwrap_or_default();
+        retry_backoff.validate()?;
+
         Ok(Worker {
             pool,
             queue,
             max_attempts: self.max_attempts,
             lease_timeout: self.lease_timeout,
             batch_size: self.batch_size,
-            default_retry_delay: self.default_retry_delay,
+            retry_backoff,
+            panic_policy: self.panic_policy,
             poll_interval: self.poll_interval,
             concurrency,
             handler_timeout,
@@ -509,7 +540,8 @@ pub struct Worker<T, C = JsonCodec> {
     max_attempts: u32,
     lease_timeout: Duration,
     batch_size: u32,
-    default_retry_delay: Duration,
+    retry_backoff: BackoffPolicy,
+    panic_policy: PanicPolicy,
     poll_interval: Duration,
     concurrency: usize,
     handler_timeout: Duration,
@@ -527,7 +559,8 @@ impl<T, C> std::fmt::Debug for Worker<T, C> {
             .field("max_attempts", &self.max_attempts)
             .field("lease_timeout", &self.lease_timeout)
             .field("batch_size", &self.batch_size)
-            .field("default_retry_delay", &self.default_retry_delay)
+            .field("retry_backoff", &self.retry_backoff)
+            .field("panic_policy", &self.panic_policy)
             .field("poll_interval", &self.poll_interval)
             .field("concurrency", &self.concurrency)
             .field("handler_timeout", &self.handler_timeout)
@@ -618,7 +651,8 @@ where
                 lease_token,
                 attempts,
                 max_attempts,
-                self.default_retry_delay,
+                self.retry_backoff,
+                self.poll_interval,
                 result,
                 &mut stats,
             )
@@ -676,7 +710,8 @@ where
             lease_timeout: self.lease_timeout,
             handler_timeout: self.handler_timeout,
             mark_timeout: self.mark_timeout,
-            default_retry_delay: self.default_retry_delay,
+            retry_backoff: self.retry_backoff,
+            panic_policy: self.panic_policy,
             batch_size: batch_size_usize,
             poll_interval: self.poll_interval,
             reaper_interval: self.reaper_interval,
@@ -718,7 +753,8 @@ pub(crate) struct WorkerState<T, C> {
     pub(crate) lease_timeout: Duration,
     pub(crate) handler_timeout: Duration,
     pub(crate) mark_timeout: Duration,
-    pub(crate) default_retry_delay: Duration,
+    pub(crate) retry_backoff: BackoffPolicy,
+    pub(crate) panic_policy: PanicPolicy,
     pub(crate) batch_size: usize,
     pub(crate) poll_interval: Duration,
     pub(crate) reaper_interval: Duration,
@@ -1035,32 +1071,65 @@ where
             )
             .await;
         }
-        // Inner task panic or cancellation. Faza 4 routes panic through
-        // `mark_retry` (current default; Faza 6 introduces PanicPolicy).
+        // Inner task panic or cancellation. Faza 6 routes via PanicPolicy:
+        // - PanicPolicy::Retry → synthesize `JobError::Retry` + backoff;
+        // - PanicPolicy::Dead → bypass retry budget; flip dead immediately.
         Some(Err(je)) if je.is_panic() => {
-            let msg = "handler panic";
-            let synthesized: Result<(), JobError> = Err(JobError::Retry {
-                reason: format!("panic: {msg}"),
-                retry_in: None,
-            });
-            tracing::error!(
-                worker.id = %state.worker_id,
-                job.id = id,
-                job.public_id = %public_id,
-                "handler panicked; routing through mark_retry (Faza 6 adds PanicPolicy)"
-            );
-            apply_handler_result_state(
-                &state,
-                identity,
-                &queue,
-                public_id,
-                id,
-                lease_token,
-                attempts,
-                max_attempts,
-                synthesized,
-            )
-            .await;
+            // Trim panic reason ONCE at the top — both Retry and Dead
+            // branches use the same value. apply_handler_result_state will
+            // re-trim downstream (no-op since the value is already at or
+            // below the truncation limit).
+            let msg = crate::reaper::extract_panic_message(je);
+            let trimmed_reason = fmt_err_trimmed(&DisplayStr(format!("panic: {msg}")));
+            match state.panic_policy {
+                PanicPolicy::Retry => {
+                    tracing::error!(
+                        worker.id = %state.worker_id,
+                        job.id = id,
+                        job.public_id = %public_id,
+                        panic = %msg,
+                        policy = "retry",
+                        "handler panicked; routing through mark_retry"
+                    );
+                    let synthesized: Result<(), JobError> = Err(JobError::Retry {
+                        reason: trimmed_reason,
+                        retry_in: None,
+                    });
+                    apply_handler_result_state(
+                        &state,
+                        identity,
+                        &queue,
+                        public_id,
+                        id,
+                        lease_token,
+                        attempts,
+                        max_attempts,
+                        synthesized,
+                    )
+                    .await;
+                }
+                PanicPolicy::Dead => {
+                    tracing::error!(
+                        worker.id = %state.worker_id,
+                        job.id = id,
+                        job.public_id = %public_id,
+                        panic = %msg,
+                        policy = "dead",
+                        "handler panicked; flipping row to dead (bypass retry budget)"
+                    );
+                    flip_dead_state(
+                        &state,
+                        identity,
+                        &queue,
+                        public_id,
+                        id,
+                        lease_token,
+                        attempts,
+                        &trimmed_reason,
+                    )
+                    .await;
+                }
+            }
         }
         Some(Err(_cancelled)) => {
             // Inner task cancelled before join_next() — theoretical only;
@@ -1122,7 +1191,12 @@ async fn apply_handler_result_state<T, C>(
                 )
                 .await;
             } else {
-                let delay = retry_in.unwrap_or(state.default_retry_delay);
+                let delay = compute_retry_delay(
+                    retry_in,
+                    state.retry_backoff,
+                    state.poll_interval,
+                    attempts,
+                );
                 flip_retry_state(
                     state,
                     identity,
@@ -1361,7 +1435,8 @@ async fn apply_handler_result(
     lease_token: Uuid,
     attempts: u32,
     max_attempts: u32,
-    default_retry_delay: Duration,
+    retry_backoff: BackoffPolicy,
+    poll_interval: Duration,
     result: Result<(), JobError>,
     stats: &mut TickStats,
 ) {
@@ -1395,7 +1470,7 @@ async fn apply_handler_result(
                 )
                 .await;
             } else {
-                let delay = retry_in.unwrap_or(default_retry_delay);
+                let delay = compute_retry_delay(retry_in, retry_backoff, poll_interval, attempts);
                 flip_retry_tick(
                     pool,
                     worker,
@@ -1427,6 +1502,40 @@ async fn apply_handler_result(
             .await;
         }
     }
+}
+
+/// Compute the actual `mark_retry` delay given (optional) user override,
+/// the worker's `BackoffPolicy`, current `poll_interval`, and current
+/// `attempts` count.
+///
+/// If `retry_in.is_some()` → clamp to `[max(poll_interval, MIN_RETRY_IN), MAX_RETRY_IN]`;
+/// emit `tracing::warn!` (target = `"pgwq.retry_in.clamped"`) when the input
+/// is outside the band and we had to clamp.
+///
+/// If `retry_in.is_none()` → defer to `backoff.next(attempts)`.
+fn compute_retry_delay(
+    retry_in: Option<Duration>,
+    backoff: BackoffPolicy,
+    poll_interval: Duration,
+    attempts: u32,
+) -> Duration {
+    retry_in.map_or_else(
+        || backoff.next(attempts),
+        |requested| {
+            let floor = poll_interval.max(MIN_RETRY_IN);
+            let ceiling = MAX_RETRY_IN;
+            let clamped = requested.clamp(floor, ceiling);
+            if clamped != requested {
+                tracing::warn!(
+                    target: "pgwq.retry_in.clamped",
+                    requested_ms = u64::try_from(requested.as_millis()).unwrap_or(u64::MAX),
+                    applied_ms = u64::try_from(clamped.as_millis()).unwrap_or(u64::MAX),
+                    "retry_in clamped"
+                );
+            }
+            clamped
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

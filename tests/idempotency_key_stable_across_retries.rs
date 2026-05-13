@@ -20,7 +20,7 @@ use sqlx::Row;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use pg_work_queue::{JobContext, JobError, Pusher, Worker};
+use pg_work_queue::{BackoffPolicy, JobContext, JobError, Pusher, Worker};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 struct Payload {
@@ -48,7 +48,7 @@ async fn idempotency_key_equals_public_id_across_retries() {
         .queue("idk_q")
         .pool(pool.clone())
         .max_attempts(3)
-        .default_retry_delay(Duration::from_millis(100))
+        .retry_backoff(BackoffPolicy::fixed(Duration::from_millis(100)))
         .lease_timeout(Duration::from_secs(10))
         .reaper_interval(Duration::from_secs(2))
         .poll_interval(Duration::from_millis(100))

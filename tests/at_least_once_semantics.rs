@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use sqlx::Row;
 
-use pg_work_queue::{JobContext, JobError, Pusher, Worker};
+use pg_work_queue::{BackoffPolicy, JobContext, JobError, Pusher, Worker};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 struct Payload {
@@ -43,7 +43,7 @@ async fn handler_invoked_at_least_twice_when_first_retry() {
         .queue("alo_q")
         .pool(pool.clone())
         .max_attempts(3)
-        .default_retry_delay(Duration::from_millis(100))
+        .retry_backoff(BackoffPolicy::fixed(Duration::from_millis(100)))
         .lease_timeout(Duration::from_secs(10))
         .reaper_interval(Duration::from_secs(2))
         .poll_interval(Duration::from_millis(100))
