@@ -175,7 +175,7 @@ where
         // pool starvation doesn't block cancel.
         let pool = state.pool.clone();
         let queue = state.queue.clone();
-        let tick_task: JoinHandle<Result<Vec<ReapedRow>, sqlx::Error>> = tokio::spawn(async move {
+        let mut tick_task: JoinHandle<Result<Vec<ReapedRow>, sqlx::Error>> = tokio::spawn(async move {
             // Test-only panic injection — production callers leave the
             // static at 0 (one Relaxed load per tick).
             #[allow(clippy::panic)]
@@ -189,9 +189,21 @@ where
             reap(&pool, &queue, REAPER_BATCH_SIZE).await
         });
 
+        // We poll `&mut tick_task` (not move) so that on the cancel arm
+        // we still own the `JoinHandle` and can `.abort()` it. Dropping
+        // a `JoinHandle` does NOT cancel the task in tokio — without
+        // the explicit abort the spawned `reap()` future would outlive
+        // `reaper_loop` and, under pool starvation, could hold a pool
+        // connection up to `acquire_timeout` past `WorkerHandle::shutdown`
+        // returning. The follow-up `await` waits for the cancellation
+        // to actually take effect (yields at the next `pool.acquire()`).
         let outcome = tokio::select! {
-            r = tick_task => r,
-            () = state.shutdown.cancelled() => return,
+            r = &mut tick_task => r,
+            () = state.shutdown.cancelled() => {
+                tick_task.abort();
+                let _ = tick_task.await;
+                return;
+            }
         };
 
         match outcome {

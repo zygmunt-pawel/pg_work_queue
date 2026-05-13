@@ -55,14 +55,16 @@ const MAX_BACKOFF_CAP: Duration = Duration::from_secs(24 * 3600);
 /// // Fixed 2s delay between retries.
 /// let fixed = BackoffPolicy::fixed(Duration::from_secs(2));
 ///
-/// // Linear: 1s, 2s, 3s, ..., capped at 30s.
+/// // Linear math: next(0)=1s, next(1)=2s, next(2)=3s, ..., cap 30s.
+/// // Worker-observed (attempts ≥ 1, see `next` docs): 2s, 3s, 4s, ..., 30s.
 /// let linear = BackoffPolicy::Linear {
 ///     base: Duration::from_secs(1),
 ///     increment: Duration::from_secs(1),
 ///     cap: Duration::from_secs(30),
 /// };
 ///
-/// // Exponential: 1s, 2s, 4s, 8s, ..., capped at 5min, ±20% jitter.
+/// // Exponential math: next(0)=1s, next(1)=2s, next(2)=4s, ..., cap 5min.
+/// // Worker-observed (attempts ≥ 1): 2s, 4s, 8s, ..., 5min (±20% jitter).
 /// let exp = BackoffPolicy::Exponential {
 ///     base: Duration::from_secs(1),
 ///     factor: 2.0,
@@ -75,7 +77,10 @@ pub enum BackoffPolicy {
     /// Linear progression: `next(n) = base + increment × n`, capped at `cap`.
     /// `fixed(d)` builds `Linear { base: d, increment: 0, cap: d }`.
     Linear {
-        /// First retry delay.
+        /// Math base of `next(n) = base + increment × n`. Per
+        /// [`BackoffPolicy::next`] semantics, the worker passes
+        /// 1-indexed `attempts`, so the **observed** first retry delay
+        /// is `next(1) = base + increment`, not `base`.
         base: Duration,
         /// Per-attempt step increase.
         increment: Duration,
@@ -86,7 +91,10 @@ pub enum BackoffPolicy {
     /// `cap`. `factor` musi być > 1.0. `jitter ∈ [0.0, 1.0]` to ratio — wynik
     /// mnożony przez `1 + uniform(-jitter, +jitter)` po clampie.
     Exponential {
-        /// First retry delay.
+        /// Math base of `next(n) = base × factor.powi(n)`. Per
+        /// [`BackoffPolicy::next`] semantics, the worker passes
+        /// 1-indexed `attempts`, so the **observed** first retry delay
+        /// is `next(1) = base × factor`, not `base`.
         base: Duration,
         /// Geometric factor (must be > 1.0).
         factor: f64,
@@ -99,7 +107,12 @@ pub enum BackoffPolicy {
 
 impl Default for BackoffPolicy {
     /// Library default — `Exponential { 1s, 2.0, 5min, 0.2 }`.
-    /// Sequence: ~1s, 2s, 4s, 8s, ... 5min (±20% jitter).
+    ///
+    /// Math sequence `next(n)` for `n = 0, 1, 2, ...`: 1s, 2s, 4s,
+    /// 8s, ..., 5min. Worker-observed retry sequence (worker calls
+    /// `next(attempts)` with `attempts ≥ 1` — see
+    /// [`BackoffPolicy::next`]): 2s, 4s, 8s, 16s, ..., 5min (±20%
+    /// jitter).
     fn default() -> Self {
         Self::Exponential {
             base: Duration::from_secs(1),
@@ -131,7 +144,17 @@ impl BackoffPolicy {
         }
     }
 
-    /// Compute the retry delay for the given (1-indexed) `attempt` count.
+    /// Compute the retry delay for the given `attempt` count.
+    ///
+    /// The worker passes the **post-claim** `attempts` value (the
+    /// claim CTE in `src/claim.rs` does `attempts = j.attempts + 1`
+    /// before RETURNING), so on the first retry `attempts == 1` and
+    /// the observed delay is `next(1)`, not `next(0)`. For
+    /// `Exponential { base, factor, .. }` that means the first
+    /// observed retry is `base × factor`, not `base`. The pure unit
+    /// tests in `tests/backoff_policy_unit.rs` exercise the raw math
+    /// across `n = 0..`; operationally treat the sequence as shifted
+    /// by one.
     ///
     /// **Never panics** — internal `f64` math is overflow-safe via
     /// `is_finite()` + clamp-to-`cap`. See v3.5 regression #4.
