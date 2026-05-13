@@ -402,3 +402,20 @@ pub enum ShutdownError {
         consecutive_panics: u32,
     },
 }
+
+/// Errors returned by [`crate::purge::purge_done`], [`crate::purge::purge_dead`]
+/// and [`crate::purge::queue_stats`].
+///
+/// v0.1 collapses every underlying `sqlx::Error` into a single transparent
+/// variant — the library makes no distinction between transient connection
+/// drops and constraint violations here because operators retry purge
+/// end-to-end (chunked sweep is naturally resumable on a fresh call).
+/// Surface kept `#[non_exhaustive]` so a future release may split
+/// classify-on-retry variants without a breaking change.
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum PurgeError {
+    /// Any `sqlx::Error` raised by a chunk DELETE / stats SELECT.
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+}

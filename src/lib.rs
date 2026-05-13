@@ -7,6 +7,7 @@ pub mod codec;
 pub mod error;
 pub mod limits;
 pub mod migrator;
+pub mod purge;
 pub mod pusher;
 pub mod worker;
 
@@ -24,14 +25,12 @@ pub(crate) mod util;
 // and will be re-enabled as those phases land.
 pub use crate::backoff::{BackoffPolicy, PanicPolicy};
 pub use crate::codec::{Codec, JsonCodec};
-pub use crate::error::{BuildError, JobError, PushError, ShutdownError, StartError};
+pub use crate::error::{BuildError, JobError, PurgeError, PushError, ShutdownError, StartError};
 pub use crate::job::{Job, JobContext};
 pub use crate::migrator::migrator;
+pub use crate::purge::{QueueStats, purge_dead, purge_done, queue_stats};
 pub use crate::pusher::Pusher;
 pub use crate::worker::{Stats, TickStats, Worker, WorkerBuilder, WorkerHandle};
-
-// pub use crate::error::PurgeError;                                         // (Faza 8)
-// pub use crate::purge::{purge_dead, purge_done, queue_stats, QueueStats};  // (Faza 8)
 
 /// Hidden re-exports used by integration tests under `tests/`. NOT part of
 /// the public API; may change or vanish at any time.

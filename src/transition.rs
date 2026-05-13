@@ -25,7 +25,12 @@ use uuid::Uuid;
 /// on every `pgwq.state.transition` event so operators can attribute the
 /// flip to a specific subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Purge` lands w Fazie 8 (Reaper jest już used z Fazy 5)
+// `Purge` is structurally allowed as a transition source but Phase 8 only
+// emits an aggregate `tracing::info!` per `purge_*` call (PLAN.md state
+// transition table: `dead`/`done` → ∅ is 1 event per call, not per row).
+// Per-row purge transitions would land in v0.2 if/when retention auditing
+// becomes a requirement.
+#[allow(dead_code)]
 pub enum TransitionSource {
     /// `Worker` claimed → handler executed → `mark_*`.
     Worker,
