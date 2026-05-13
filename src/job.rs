@@ -46,7 +46,12 @@ pub struct Job<T> {
 /// * `public_id` matches the DB column name and the `Pusher::push` return.
 /// * `idempotency_key` matches the handler intent at external-API call sites
 ///   (e.g. `stripe.charge(amount, &ctx.idempotency_key.to_string())`).
+///
+/// The struct is `#[non_exhaustive]`: future additive fields are not a
+/// breaking change. Handlers should access fields by name (`ctx.attempt`)
+/// rather than destructuring exhaustively.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct JobContext {
     /// Internal BIGINT PK.
     pub id: i64,
@@ -59,6 +64,14 @@ pub struct JobContext {
     pub queue: String,
     /// 1-indexed current attempt.
     pub attempt: u32,
+    /// Per-row `max_attempts` stamped by the *claiming* worker. Compare with
+    /// `attempt` to branch handler-side on remaining retry budget — e.g.
+    /// warn-and-alert on `attempt == max_attempts`, or run a once-per-job
+    /// DLQ side-effect on the final retry. Rolling-deploy safe: the value
+    /// is whatever the claiming worker stamped at claim time, *not* the
+    /// current builder's `.max_attempts(...)` (see schema docs on
+    /// `max_attempts`).
+    pub max_attempts: u32,
     /// Timestamp of the very first attempt.
     pub first_attempted_at: DateTime<Utc>,
     /// Fencing token for the current claim.
@@ -79,6 +92,7 @@ impl<T> Job<T> {
             idempotency_key: self.public_id,
             queue: self.queue.clone(),
             attempt: self.attempts,
+            max_attempts: self.max_attempts,
             first_attempted_at: self.first_attempted_at,
             lease_token: self.lease_token,
         }

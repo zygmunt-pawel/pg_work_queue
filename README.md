@@ -340,6 +340,73 @@ can expire while the handler is still running. Use
 `tokio::task::spawn_blocking` for blocking work, or sprinkle
 `tokio::task::yield_now().await` between iterations.
 
+### Branching on retry budget
+
+`JobContext` exposes both `attempt` (1-indexed current) and `max_attempts`
+(per-row value stamped by the claiming worker — *not* the current
+builder's setting, so rolling deploys that change `.max_attempts(...)`
+do not retroactively rewrite in-flight rows). Use the pair to branch
+handler logic on remaining retry budget without trusting an out-of-band
+config.
+
+Note: the library already upgrades `JobError::Retry` to `mark_dead`
+when `attempts >= max_attempts`, so the handler does **not** need to
+detect the last attempt in order to dead-letter. The patterns below
+are about what the *handler* should do differently when it knows the
+retry budget is about to run out — observability, side effects, perf
+tuning — not about controlling the row's terminal state.
+
+**Warn-and-alert on final retry.** Emits a distinct tracing event the
+last time around, so oncall can alert on `pgwq.final_attempt` without
+false positives for every transient failure:
+
+```rust
+# use pg_work_queue::{JobContext, JobError};
+# #[derive(serde::Deserialize)] struct Email { to: String }
+# async fn send_email(_e: &Email) -> Result<(), String> { Ok(()) }
+async fn handle(task: Email, ctx: JobContext) -> Result<(), JobError> {
+    let res = send_email(&task).await;
+    if res.is_err() && ctx.attempt == ctx.max_attempts {
+        tracing::warn!(
+            target: "pgwq.final_attempt",     // user-defined; the library does not emit this
+            job.id = ctx.id,
+            attempt = ctx.attempt,
+            "final retry about to be dead-lettered"
+        );
+    }
+    res.map_err(JobError::retry)
+}
+```
+
+**Branching retry-only fallbacks.** Cheap-and-fast on early attempts,
+spend the budget on the last shot:
+
+```rust
+# use pg_work_queue::{JobContext, JobError};
+# use std::time::Duration;
+# #[derive(serde::Deserialize)] struct Fetch { url: String }
+# struct Client; impl Client {
+#     fn get(&self, _u: &str) -> Self { Client }
+#     fn timeout(self, _d: Duration) -> Self { Client }
+#     async fn send(self) -> Result<(), String> { Ok(()) }
+# }
+# let http_client = Client;
+async fn handle(task: Fetch, ctx: JobContext) -> Result<(), JobError> {
+    let timeout = if ctx.attempt < ctx.max_attempts {
+        Duration::from_secs(5)    // fail-fast, retry budget left
+    } else {
+        Duration::from_secs(60)   // last shot, give it room
+    };
+    # let http_client = Client;
+    http_client.get(&task.url).timeout(timeout).send().await
+        .map_err(JobError::retry)
+}
+```
+
+Same shape works for "try fallback DNS resolver only on last attempt",
+"accept stale cache on last attempt instead of regenerating", or
+"insert into manual-review table once before dead-lettering".
+
 ## State machine and schema
 
 ```
@@ -619,12 +686,14 @@ not a per-shutdown delta.
 ### `JobContext` — handler argument
 
 ```rust
+#[non_exhaustive]
 pub struct JobContext {
     pub id: i64,
     pub public_id: Uuid,
     pub idempotency_key: Uuid,    // == public_id
     pub queue: String,
     pub attempt: u32,             // 1-indexed
+    pub max_attempts: u32,        // per-row, stamped at claim time
     pub first_attempted_at: DateTime<Utc>,
     pub lease_token: Uuid,
 }
@@ -634,6 +703,14 @@ pub struct JobContext {
 names are intentional aliases for readability at the call site
 (`public_id` matches DB / `Pusher::push` return; `idempotency_key`
 matches handler intent on external API calls).
+
+`max_attempts` is the per-row value stamped by the *claiming* worker
+(see [Branching on retry budget](#branching-on-retry-budget)), not the
+current `WorkerBuilder`'s `.max_attempts(...)` — rolling-deploy safe.
+
+The struct is `#[non_exhaustive]`: future additive fields are not a
+breaking change. Access fields by name (`ctx.attempt`,
+`ctx.max_attempts`) rather than destructuring exhaustively.
 
 `Job<T>` is the corresponding *internal* pipeline element produced by
 `claim_and_decode`; the only public surface is the `.context()`
