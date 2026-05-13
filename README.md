@@ -517,9 +517,12 @@ pub fn migrator() -> sqlx::migrate::Migrator;
 
 Returns the embedded `sqlx::Migrator` for the crate's schema. Call
 `.run(&pool).await` once at startup, before `Worker::start`. The library
-**does not** migrate automatically (explicit > implicit). See
-[Known limitations](#known-limitations) for the `_sqlx_migrations`
-table-name collision and workarounds.
+**does not** migrate automatically (explicit > implicit). Internally
+the returned migrator has `set_ignore_missing(true)`, so it co-exists
+with other sqlx migrators sharing `_sqlx_migrations` without erroring
+on each other's rows. See [Known limitations](#known-limitations) for
+the remaining caveats (unique filename `version`, no table namespacing
+until sqlx 0.9).
 
 ### `Pusher` — enqueue side
 

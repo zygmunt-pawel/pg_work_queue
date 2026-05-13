@@ -30,6 +30,7 @@ cargo test --test <file_stem>                # single integration test file, e.g
 cargo test --test <file_stem> -- <name>      # single test within a file
 RUST_LOG=info,sqlx=warn cargo test ...       # tracing-subscriber honors RUST_LOG via the shared `init_tracing()` helper
 cargo doc --no-deps --open                   # rustdoc — the public API is documented in-tree, this is the local fallback for docs.rs
+cargo deny check                             # supply-chain audit (advisories + licenses + bans + sources); needs `cargo install --locked cargo-deny`. CI runs the same daily — local invocation only when iterating on deny.toml.
 ```
 
 Lint posture (`Cargo.toml [lints]`): `unsafe_code = forbid`,
