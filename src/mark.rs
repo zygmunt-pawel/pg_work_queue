@@ -71,10 +71,12 @@ pub async fn mark_done(pool: &PgPool, id: i64, lease_token: Uuid) -> Result<u64,
     Ok(res.rows_affected())
 }
 
-/// Transition a claimed row to `awaiting_retry` with `run_at = now() + delay`
-/// computed **server-side** so the row's `run_at` is anchored to the database
-/// clock (defends against worker host NTP skew — symmetrical with
-/// `claim_batch`, which already uses `now() + interval` for `lease_expires_at`).
+/// Transition a claimed row to `awaiting_retry`.
+///
+/// `run_at = now() + delay` is computed **server-side** so the row's
+/// `run_at` is anchored to the database clock (defends against worker host
+/// NTP skew — symmetrical with `claim_batch`, which already uses
+/// `now() + interval` for `lease_expires_at`).
 ///
 /// SQL per PLAN.md §"Mark queries". Caller MUST have already truncated
 /// `reason` via `util::fmt_err_trimmed`. Returns `rows_affected`:
