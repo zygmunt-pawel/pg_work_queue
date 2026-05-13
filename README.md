@@ -254,6 +254,30 @@ is never blocked by) running workers.
 
 See `PLAN.md` for the full anti-features rationale.
 
+## Known limitations
+
+### Shared `_sqlx_migrations` table
+
+`pg_work_queue::migrator()` uses `sqlx::migrate!()` which (in `sqlx`
+`0.8.x`) hard-codes the migration tracking table to `_sqlx_migrations`.
+If your application also runs `sqlx::migrate!()` against the same
+database, `version` collisions are a matter of time — both migrators
+write to the same table and treat each other's rows as "missing
+migrations".
+
+Workarounds for now:
+
+- Apply this crate's migrations against a database that is **not**
+  shared with your application's own sqlx-managed schema, or
+- Run the embedded SQL in `migrations/20260513000000_v01_init.sql`
+  yourself via your own migration tooling, skipping
+  `pg_work_queue::migrator()`.
+
+`sqlx::migrate::Migrator::dangerous_set_table_name` (which would let us
+namespace the table to `_pgwq_migrations`) is only available on the
+`sqlx` `0.9` line — pinned `0.8.6` here predates it. The fix will land
+once `sqlx 0.9` reaches a stable release.
+
 ## Testing
 
 Integration tests run against real Postgres via
