@@ -233,6 +233,7 @@ pub struct WorkerBuilder<T, C = JsonCodec, H = ()> {
     handler_timeout: Option<Duration>,
     mark_timeout: Option<Duration>,
     reaper_interval: Option<Duration>,
+    shutdown_token: Option<CancellationToken>,
     codec: C,
     handler: H,
     _payload: PhantomData<fn() -> T>,
@@ -254,6 +255,7 @@ impl<T> WorkerBuilder<T, JsonCodec, ()> {
             handler_timeout: None,
             mark_timeout: None,
             reaper_interval: None,
+            shutdown_token: None,
             codec: JsonCodec,
             handler: (),
             _payload: PhantomData,
@@ -496,6 +498,29 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
         self
     }
 
+    /// Plumb an external [`CancellationToken`] so the worker's poll loop,
+    /// reaper, and in-flight handlers can be cancelled by a token owned
+    /// outside the worker. Default: `None` (a fresh token is created in
+    /// [`Worker::start`]).
+    ///
+    /// **Use case**: spawn `N` workers under one parent token via
+    /// `.shutdown_token(parent.child_token())`; a single `parent.cancel()`
+    /// then triggers graceful drain across all of them simultaneously.
+    ///
+    /// **Semantics**: cancellation propagates *down* the `tokio-util`
+    /// parent→child tree. [`WorkerHandle::cancel`] /
+    /// [`WorkerHandle::shutdown`] still cancel only this worker (firing
+    /// the child token does not climb up to siblings). Dropping the
+    /// user-side parent does NOT abort this worker — `WorkerState` clones
+    /// the token on construction.
+    ///
+    /// See `tests/shutdown_token_propagates_to_workers.rs`.
+    #[must_use]
+    pub fn shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
+        self
+    }
+
     /// Swap the payload codec. Default: [`JsonCodec`].
     ///
     /// **Observable effect**: how `payload BYTEA` is decoded before
@@ -507,6 +532,7 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
     /// `tests/codec_decode_error_marks_dead.rs`.
     pub fn codec<C2: Codec>(self, codec: C2) -> WorkerBuilder<T, C2, H> {
         WorkerBuilder {
+            shutdown_token: self.shutdown_token,
             pool: self.pool,
             queue: self.queue,
             max_attempts: self.max_attempts,
@@ -558,6 +584,7 @@ where
         Fut: Future<Output = Result<(), JobError>> + Send + 'static,
     {
         WorkerBuilder {
+            shutdown_token: self.shutdown_token,
             pool: self.pool,
             queue: self.queue,
             max_attempts: self.max_attempts,
@@ -737,6 +764,7 @@ where
             handler_timeout,
             mark_timeout,
             reaper_interval,
+            shutdown_token: self.shutdown_token,
             codec: self.codec,
             handler: self.handler,
             _payload: PhantomData,
@@ -777,6 +805,7 @@ pub struct Worker<T, C = JsonCodec> {
     handler_timeout: Duration,
     mark_timeout: Duration,
     reaper_interval: Duration,
+    shutdown_token: Option<CancellationToken>,
     codec: C,
     handler: Arc<dyn JobHandler<T>>,
     _payload: PhantomData<fn() -> T>,
@@ -946,7 +975,7 @@ where
             poll_interval: self.poll_interval,
             reaper_interval: self.reaper_interval,
             semaphore: Arc::new(Semaphore::new(self.concurrency)),
-            shutdown: CancellationToken::new(),
+            shutdown: self.shutdown_token.unwrap_or_default(),
             tasks: Mutex::new(JoinSet::new()),
             stats: AtomicStats::default(),
             last_fatal: OnceLock::new(),
