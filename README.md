@@ -619,7 +619,14 @@ produces a sensible runtime.
   hold one connection for work + one for `mark_*`; the poll loop and
   reaper each need a slot. Read via
   `pool.options().get_max_connections()` (NOT `pool.size()`, which is
-  lazy and returns 0 for fresh pools).
+  lazy and returns 0 for fresh pools). **This is a per-worker floor.**
+  If several workers share the same `PgPool`, the joint floor is
+  `Σᵢ (concurrencyᵢ × 2) + 2N` where `N` is the worker count; the
+  builder cannot enforce that because each `Worker::start` only sees
+  its own pool handle. Under-provisioning a shared pool manifests as
+  mark-timeout cascades and growing `pending_recovery`. Recommendation:
+  either size the shared pool to the joint floor, or give each worker
+  its own pool.
 
 `BuildError` is `#[non_exhaustive]` so new constraints can be added
 without a breaking change.
@@ -685,6 +692,15 @@ Three terminal methods:
 
 The `Stats` returned by `shutdown` is monotonic since worker start —
 not a per-shutdown delta.
+
+**`Drop` safety net.** If a `WorkerHandle` is dropped *without* calling
+`shutdown` / `join` / `cancel` first, its `Drop` impl fires the
+cancellation token and `abort()`s both the poll and reaper tasks
+best-effort. Without that, a dropped handle would silently leak both
+loops (each holding an `Arc<WorkerState>` + a pool connection) — the
+classic tokio footgun where a dropped `JoinHandle` *detaches* rather
+than aborting. Explicit `shutdown` is still the production-recommended
+path because `Drop` is sync (no `await`, no handler drain, no `Stats`).
 
 ### `JobContext` — handler argument
 
@@ -918,7 +934,7 @@ v0.1; treat it as `#[non_exhaustive]` for forward-compat).
 | `PushError` | `Pusher::push*`. Includes `is_retriable()` helper — `true` only for `Transient` (network/IO/pool); everything else is a deterministic caller-bug-style error. SQLSTATE class `23` (integrity) is classified as `Constraint`. |
 | `BuildError` | `WorkerBuilder::build`. Covers every per-knob constraint plus cross-knob invariants and `Pool*` mismatches. |
 | `StartError` | `Worker::start`. `SchemaMissing` is the loud-fail surface for `42P01` / `3F000` (schema or table missing); other sqlx errors come through `Database`. |
-| `ShutdownError` | `WorkerHandle::{join, shutdown}`. `Fatal(Arc<sqlx::Error>)` for fatal classifier hits in poll/reaper; `ReaperPanicEscalation { consecutive_panics }` for the reaper's 3-strikes self-shutdown. `Timeout` and `AlreadyShutdown` are reserved for v0.2 (the current API consumes `self` so they're unreachable in practice). |
+| `ShutdownError` | `WorkerHandle::{join, shutdown}`. `Fatal(Arc<sqlx::Error>)` for fatal classifier hits in poll/reaper **and** for poll loops that exceeded `MAX_CONSECUTIVE_CLAIM_ERRORS` non-fatal errors in a row (the most recent error becomes the payload); `ReaperPanicEscalation { consecutive_panics }` for the reaper's 3-strikes self-shutdown. `Timeout` and `AlreadyShutdown` are reserved for v0.2 (the current API consumes `self` so they're unreachable in practice). |
 | `PurgeError` | `purge_done` / `purge_dead` / `queue_stats`. Single `Database(sqlx::Error)` variant; left `#[non_exhaustive]` so future versions may classify retriable-vs-fatal without breaking callers. |
 | `JobError` | Returned *by* the handler — see [`JobError`](#joberror--handler-outcome). |
 
@@ -929,11 +945,24 @@ The poll loop and the reaper both use the same classifier
 
 - **Fatal** (worker self-shuts via `state.last_fatal.set(...)` +
   `shutdown.cancel()`):
-  `PoolClosed`, `WorkerCrashed`, `Configuration(_)`, `Migrate(_)`,
-  `ColumnDecode { .. }`, `Decode(_)`, `TypeNotFound { .. }`,
-  `ColumnNotFound(_)`, `Protocol(_)`.
-- **Transient** (logged at `warn!`, retry next tick):
-  `Database(_)`, `Io(_)`, `Tls(_)`, `PoolTimedOut`.
+  - sqlx-level: `PoolClosed`, `WorkerCrashed`, `Configuration(_)`,
+    `Migrate(_)`, `ColumnDecode { .. }`, `Decode(_)`,
+    `TypeNotFound { .. }`, `ColumnNotFound(_)`, `Protocol(_)`.
+  - `Database(_)` with SQLSTATE in classes `42` (syntax / undefined
+    object — schema drift), `0A` (feature not supported), `23`
+    (integrity constraint — CHECK / FK / NOT NULL / unique; our state-
+    -machine CHECK is the canonical hit), or `57P01` / `57P02` / `57P03`
+    (admin shutdown, crash shutdown, `cannot_connect_now`). These signal
+    a server-side state retrying will never escape.
+- **Transient** (logged at `warn!`, retry next tick): every other
+  `Database(_)`, plus `Io(_)`, `Tls(_)`, `PoolTimedOut`. **Defense-in-
+  -depth**: if `MAX_CONSECUTIVE_CLAIM_ERRORS` (30) ticks in a row hit
+  the transient branch — e.g., persistent TLS / network / pool-config
+  outage that doesn't surface a fatal SQLSTATE — the poll loop escalates
+  the most recent error to `last_fatal` and self-shuts. Without this,
+  a permanent outage would log `warn!` forever and `WorkerHandle::join`
+  would never return `Fatal`. The counter resets on any successful
+  `claim_batch` (including empty results).
 
 ### Resource limits
 
@@ -952,6 +981,7 @@ constant has a matching DB CHECK or builder validation):
 | `MIN_MARK_TIMEOUT` | 100 ms |
 | `REAPER_BATCH_SIZE` | 1024 |
 | `PURGE_CHUNK_SIZE` | 10 000 |
+| `MAX_CONSECUTIVE_CLAIM_ERRORS` | 30 (ticks before transient-error escalation; see fatal-vs-transient classifier above) |
 
 The reaper's `MIN_REAPER_INTERVAL = 1s` lives in the `reaper` module
 (it is the only floor that isn't a generic resource bound).

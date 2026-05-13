@@ -35,7 +35,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError};
@@ -294,6 +293,18 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
     /// Pool starvation manifests as `Stats::mark_timed_out` increments
     /// (the `mark_*` SQL wrapper trips its timeout while waiting for an
     /// acquire) and rows left in `'running'` that the reaper recovers.
+    ///
+    /// **Multi-worker pool sharing (operator responsibility, not validated)**:
+    /// The `concurrency × 2 + 2` rule is a *per-worker* lower bound. If
+    /// `N` workers share the **same** `PgPool`, the joint floor is
+    /// `Σᵢ (concurrencyᵢ × 2) + 2N`. The builder cannot enforce this
+    /// because each `Worker::start` only sees its own pool handle and
+    /// has no view of sibling workers. Under-provisioning manifests
+    /// exactly like single-worker pool starvation (mark timeouts, reaper
+    /// falling behind, growing `pending_recovery`) but is harder to
+    /// diagnose because no single worker hit `PoolTooSmall` at build.
+    /// **Recommendation**: either size the shared pool to the joint
+    /// floor, or give each worker its own pool.
     ///
     /// See `tests/builder_validation.rs` (`PoolTooSmall`) and
     /// `tests/shutdown_immediate_with_pool_starvation.rs`.
@@ -992,11 +1003,13 @@ where
         let reaper_abort = reaper_join.abort_handle();
 
         Ok(WorkerHandle {
-            state,
-            poll_join,
-            poll_abort,
-            reaper_join,
-            reaper_abort,
+            inner: Some(WorkerHandleInner {
+                state,
+                poll_join,
+                poll_abort,
+                reaper_join,
+                reaper_abort,
+            }),
         })
     }
 }
@@ -1041,7 +1054,25 @@ pub(crate) struct WorkerState<T, C> {
 ///   timeout; no Stats. Kept for back-compat with Faza 4 surface.
 /// - [`WorkerHandle::shutdown`] — preferred for production. Bounded shutdown
 ///   with hard-abort cascade + best-effort `Stats` snapshot.
+///
+/// **Drop safety**: if the handle is dropped *without* calling `shutdown` /
+/// `join` / `cancel`, the `Drop` impl fires the cancellation token and
+/// aborts the poll / reaper tasks. Without that defense a dropped handle
+/// would silently leak both background loops — the classic tokio footgun
+/// where dropping a `JoinHandle` *detaches* rather than aborting. Each
+/// leaked loop holds an `Arc<WorkerState>` and a pool connection. Explicit
+/// `shutdown` is still the production-recommended path because `Drop` is
+/// necessarily best-effort (sync, no `await`, no Stats).
 pub struct WorkerHandle {
+    // Option<_> wrap: `shutdown` / `join` consume the inner via `.take()`
+    // so they can move owned `JoinHandle`s into local locals (Rust forbids
+    // partial moves out of a `&mut self` that has a `Drop` impl). After a
+    // method consumed inner, `Drop` runs on an `inner = None` and short-
+    // -circuits — see the `Drop` impl below.
+    inner: Option<WorkerHandleInner>,
+}
+
+struct WorkerHandleInner {
     state: Arc<dyn WorkerStateOps>,
     poll_join: JoinHandle<()>,
     poll_abort: AbortHandle,
@@ -1055,6 +1086,24 @@ impl std::fmt::Debug for WorkerHandle {
     }
 }
 
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // Reached only when the handle was dropped without calling
+            // `shutdown` / `join` (those `.take()` `inner` themselves and
+            // leave `None` here). Best-effort: cancel the shared token and
+            // abort both background tasks. JoinHandles drop unawaited
+            // (detach), but the tasks were already told to stop, so they
+            // exit at their next `.await` or via the `abort()` we just
+            // fired. No drain, no Stats — that's what explicit `shutdown`
+            // is for.
+            inner.state.cancel_shutdown();
+            inner.poll_abort.abort();
+            inner.reaper_abort.abort();
+        }
+    }
+}
+
 impl WorkerHandle {
     /// Trigger shutdown signal. Poll loop exits at the next `.await` point
     /// (cancellation is intercepted via `tokio::select!`). Idempotent.
@@ -1063,7 +1112,9 @@ impl WorkerHandle {
     /// For production, prefer [`WorkerHandle::shutdown`] (atomic
     /// cancel + bounded drain + Stats).
     pub fn cancel(&self) {
-        self.state.cancel_shutdown();
+        if let Some(inner) = self.inner.as_ref() {
+            inner.state.cancel_shutdown();
+        }
     }
 
     /// Await poll loop + reaper loop completion, then drain in-flight handlers.
@@ -1078,26 +1129,33 @@ impl WorkerHandle {
     ///
     /// # Errors
     /// See above.
-    pub async fn join(self) -> Result<(), ShutdownError> {
+    pub async fn join(mut self) -> Result<(), ShutdownError> {
+        // `inner` is always `Some` for a fresh handle. If a future refactor
+        // ever splits ownership and reaches here twice, the defensive `else`
+        // returns `Ok(())` rather than panicking (CLAUDE.md: panic-deny).
+        let Some(inner) = self.inner.take() else {
+            return Ok(());
+        };
+
         // 1) Await poll loop natural exit (already cancelled or self-shut).
-        let _ = self.poll_join.await;
+        let _ = inner.poll_join.await;
 
         // 2) Await reaper loop natural exit. Single shared CancellationToken
         //    in WorkerState wakes both — by the time poll_join completes the
         //    reaper has either also seen the cancel, or will see it now.
-        let _ = self.reaper_join.await;
+        let _ = inner.reaper_join.await;
 
         // 3) Drain handler JoinSet. Each handle_job task is fire-and-forget;
         //    we wait until JoinSet is empty so all mark_* commits have a
         //    chance to land.
-        self.state.drain_handlers().await;
+        inner.state.drain_handlers().await;
 
         // 4) Surface fatal poll-loop / reaper error if any.
-        if let Some(fatal) = self.state.last_fatal_snapshot() {
+        if let Some(fatal) = inner.state.last_fatal_snapshot() {
             return Err(ShutdownError::Fatal(fatal));
         }
         // 5) Reaper panic escalation — Phase 5 surface gap closure.
-        if let Some(consecutive_panics) = self.state.last_panic_escalation_snapshot() {
+        if let Some(consecutive_panics) = inner.state.last_panic_escalation_snapshot() {
             return Err(ShutdownError::ReaperPanicEscalation { consecutive_panics });
         }
         Ok(())
@@ -1130,50 +1188,58 @@ impl WorkerHandle {
     /// `Fatal` wins over `ReaperPanicEscalation` if both are set. On the
     /// happy path Stats is returned even if the soft-drain stage exhausted
     /// the timeout — Step 5 always completes synchronously after `abort_all`.
-    pub async fn shutdown(self, timeout: Duration) -> Result<Stats, ShutdownError> {
+    pub async fn shutdown(mut self, timeout: Duration) -> Result<Stats, ShutdownError> {
+        // Take inner so we can move owned `JoinHandle`s into the soft-drain
+        // block below. After this point `self.inner` is `None`; the `Drop`
+        // impl short-circuits when the handle is finally dropped at end of
+        // scope.
+        let Some(inner) = self.inner.take() else {
+            return Ok(Stats::default());
+        };
+
         // Capture absolute deadline up-front so each phase honors a single
         // wall-clock budget.
         let start = tokio::time::Instant::now();
         let deadline = start + timeout;
 
         // 1) Soft cancel.
-        self.state.cancel_shutdown();
+        inner.state.cancel_shutdown();
 
         // 2) Soft drain (timeout/2) on poll + reaper.
         let half = timeout / 2;
         let _ = tokio::time::timeout(half, async {
-            let _ = self.poll_join.await;
-            let _ = self.reaper_join.await;
+            let _ = inner.poll_join.await;
+            let _ = inner.reaper_join.await;
         })
         .await;
 
         // 3) Hard abort poll + reaper. Cheap idempotent — both ignore the
         //    abort if the task already exited.
-        self.poll_abort.abort();
-        self.reaper_abort.abort();
+        inner.poll_abort.abort();
+        inner.reaper_abort.abort();
 
         // 4) Handler drain up to overall deadline (may be Instant::now()
         //    if step 2 burned the whole budget — that's fine; the call
         //    short-circuits via `timeout_at`).
-        let _drained_clean = self.state.drain_handlers_until(deadline).await;
+        let _drained_clean = inner.state.drain_handlers_until(deadline).await;
 
         // 5) Hard abort remaining handlers — cascade via JoinSet drop +
         //    abort_all. We attribute each remaining task to `aborted`.
         //    Cap the post-abort wait at 1s so a non-cooperating handler
         //    (theoretical: blocking syscall) can't extend shutdown.
-        let _aborted_now = self
+        let _aborted_now = inner
             .state
             .abort_remaining_handlers(Duration::from_secs(1))
             .await;
 
         // 6) pending_recovery — best-effort DB lookup under a small timeout.
-        let pending_recovery = self
+        let pending_recovery = inner
             .state
             .count_pending_recovery(Duration::from_millis(500))
             .await;
 
         // 7) Build Stats + classify terminal errors.
-        let mut stats = self.state.snapshot_stats();
+        let mut stats = inner.state.snapshot_stats();
         stats.pending_recovery = pending_recovery;
 
         tracing::info!(
@@ -1189,10 +1255,10 @@ impl WorkerHandle {
             "worker shutdown complete"
         );
 
-        if let Some(fatal) = self.state.last_fatal_snapshot() {
+        if let Some(fatal) = inner.state.last_fatal_snapshot() {
             return Err(ShutdownError::Fatal(fatal));
         }
-        if let Some(consecutive_panics) = self.state.last_panic_escalation_snapshot() {
+        if let Some(consecutive_panics) = inner.state.last_panic_escalation_snapshot() {
             return Err(ShutdownError::ReaperPanicEscalation { consecutive_panics });
         }
         Ok(stats)
@@ -1393,6 +1459,12 @@ where
     let mut ticker = tokio::time::interval(state.poll_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    // W#5 — consecutive non-fatal claim errors. After `MAX_CONSECUTIVE_CLAIM_
+    // ERRORS` ticks fail in a row, the worker self-shuts with the most recent
+    // error as `last_fatal`, surfacing through `WorkerHandle::{join, shutdown}`
+    // as `ShutdownError::Fatal`. Reset on any `Ok(_)` from `claim_and_decode`.
+    let mut consecutive_claim_errors: u32 = 0;
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {},
@@ -1447,10 +1519,12 @@ where
 
         match claim_result {
             Ok(rows) if rows.is_empty() => {
+                consecutive_claim_errors = 0;
                 tick_span.record("claimed", 0u64);
                 // Permits drop at end of iteration — return slots.
             }
             Ok(rows) => {
+                consecutive_claim_errors = 0;
                 let n = rows.len();
                 tick_span.record("claimed", n as u64);
                 tracing::debug!(claimed = n, wanted = want, "batch claimed");
@@ -1479,8 +1553,23 @@ where
                 break;
             }
             Err(e) => {
+                consecutive_claim_errors = consecutive_claim_errors.saturating_add(1);
+                if consecutive_claim_errors >= crate::limits::MAX_CONSECUTIVE_CLAIM_ERRORS {
+                    tracing::error!(
+                        worker.id = %state.worker_id,
+                        consecutive_errors = consecutive_claim_errors,
+                        threshold = crate::limits::MAX_CONSECUTIVE_CLAIM_ERRORS,
+                        error = %e,
+                        "claim batch hit consecutive-error threshold; escalating to fatal"
+                    );
+                    let _ = state.last_fatal.set(Arc::new(e));
+                    state.shutdown.cancel();
+                    break;
+                }
                 tracing::warn!(
                     worker.id = %state.worker_id,
+                    consecutive_errors = consecutive_claim_errors,
+                    threshold = crate::limits::MAX_CONSECUTIVE_CLAIM_ERRORS,
                     error = %e,
                     "claim batch failed; will retry next tick"
                 );
@@ -1815,12 +1904,9 @@ async fn flip_retry_state<T, C>(
     T: Send + 'static,
     C: Send + Sync + 'static,
 {
-    let run_at = Utc::now()
-        + chrono::Duration::from_std(delay)
-            .unwrap_or_else(|_| chrono::Duration::milliseconds(i64::MAX));
     let res = tokio::time::timeout(
         state.mark_timeout,
-        mark_retry(&state.pool, id, lease_token, reason, run_at),
+        mark_retry(&state.pool, id, lease_token, reason, delay),
     )
     .await;
     match res {
@@ -2108,10 +2194,7 @@ async fn flip_retry_tick(
     delay: Duration,
     stats: &mut TickStats,
 ) {
-    let run_at = Utc::now()
-        + chrono::Duration::from_std(delay)
-            .unwrap_or_else(|_| chrono::Duration::milliseconds(i64::MAX));
-    match mark_retry(pool, id, lease_token, reason, run_at).await {
+    match mark_retry(pool, id, lease_token, reason, delay).await {
         Ok(1) => {
             stats.failed += 1;
             emit_transition(
@@ -2198,16 +2281,31 @@ async fn flip_dead_tick(
 ///
 /// PLAN.md §"Sqlx error classification" (lines 1574-1604).
 ///
-/// Fatal: `PoolClosed`, `WorkerCrashed`, `Configuration(_)`, `Migrate(_)`,
-/// `ColumnDecode { .. }`, `Decode(_)`, `TypeNotFound { .. }`,
-/// `ColumnNotFound(_)`, `Protocol(_)`.
+/// Fatal:
+/// - sqlx-level: `PoolClosed`, `WorkerCrashed`, `Configuration(_)`,
+///   `Migrate(_)`, `ColumnDecode { .. }`, `Decode(_)`, `TypeNotFound { .. }`,
+///   `ColumnNotFound(_)`, `Protocol(_)`.
+/// - `Database(_)` with SQLSTATE that signals a server-side state the
+///   worker cannot make progress against by retrying:
+///   - class `42` — syntax / access rule (missing table/column, missing
+///     function, undefined object). Schema drift or a buggy library
+///     query; retrying will loop forever.
+///   - class `0A` — feature not supported.
+///   - class `23` — integrity constraint violation (CHECK, FK, NOT
+///     NULL, unique). Our state-machine CHECK is the canonical
+///     trigger; library bug, not transient.
+///   - `57P01` / `57P02` / `57P03` — admin/crash shutdown,
+///     `cannot_connect_now`. The session is gone; pool will rebuild,
+///     but treating these as transient masks operator-initiated
+///     shutdowns. Caller should self-shut and let the supervisor
+///     decide restart.
 ///
-/// Transient (returns false): `Database(_)`, `Io(_)`, `Tls(_)`,
-/// `PoolTimedOut`.
+/// Transient (returns false): everything else under `Database(_)`,
+/// `Io(_)`, `Tls(_)`, `PoolTimedOut`.
 #[doc(hidden)]
 #[must_use]
-pub const fn is_fatal_sqlx(e: &sqlx::Error) -> bool {
-    matches!(
+pub fn is_fatal_sqlx(e: &sqlx::Error) -> bool {
+    if matches!(
         e,
         sqlx::Error::PoolClosed
             | sqlx::Error::WorkerCrashed
@@ -2218,7 +2316,23 @@ pub const fn is_fatal_sqlx(e: &sqlx::Error) -> bool {
             | sqlx::Error::TypeNotFound { .. }
             | sqlx::Error::ColumnNotFound(_)
             | sqlx::Error::Protocol(_)
-    )
+    ) {
+        return true;
+    }
+    if let sqlx::Error::Database(db) = e
+        && let Some(code) = db.code()
+    {
+        let c: &str = code.as_ref();
+        // Class prefixes that signal fatal state.
+        if c.starts_with("42") || c.starts_with("0A") || c.starts_with("23") {
+            return true;
+        }
+        // Specific admin/crash shutdown SQLSTATEs.
+        if matches!(c, "57P01" | "57P02" | "57P03") {
+            return true;
+        }
+    }
+    false
 }
 
 /// Tiny adapter so we can route an owned `String` through `fmt_err_trimmed`

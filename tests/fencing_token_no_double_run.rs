@@ -22,7 +22,6 @@ mod common;
 
 use std::time::Duration;
 
-use chrono::Utc;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -84,7 +83,7 @@ async fn mark_queries_fenced_out_when_lease_token_drifted() {
         job.id,
         old_token,
         "retry reason",
-        Utc::now() + chrono::Duration::seconds(60),
+        std::time::Duration::from_secs(60),
     )
     .await
     .expect("mark_retry sql");

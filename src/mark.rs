@@ -9,8 +9,9 @@
 //! through `util::fmt_err_trimmed` before passing it here — `mark_*`
 //! functions only execute the SQL.
 
-use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use sqlx::postgres::types::PgInterval;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Transition a claimed row to `dead`.
@@ -70,7 +71,10 @@ pub async fn mark_done(pool: &PgPool, id: i64, lease_token: Uuid) -> Result<u64,
     Ok(res.rows_affected())
 }
 
-/// Transition a claimed row to `awaiting_retry` with a future `run_at`.
+/// Transition a claimed row to `awaiting_retry` with `run_at = now() + delay`
+/// computed **server-side** so the row's `run_at` is anchored to the database
+/// clock (defends against worker host NTP skew — symmetrical with
+/// `claim_batch`, which already uses `now() + interval` for `lease_expires_at`).
 ///
 /// SQL per PLAN.md §"Mark queries". Caller MUST have already truncated
 /// `reason` via `util::fmt_err_trimmed`. Returns `rows_affected`:
@@ -85,18 +89,27 @@ pub async fn mark_retry(
     id: i64,
     lease_token: Uuid,
     reason: &str,
-    run_at: DateTime<Utc>,
+    delay: Duration,
 ) -> Result<u64, sqlx::Error> {
+    // Saturate to i64::MAX microseconds (~292k years) — any backoff
+    // overflow already clamped by BackoffPolicy::next; this is belt-and-
+    // -braces against a caller passing a Duration > i64::MAX µs.
+    let micros = i64::try_from(delay.as_micros()).unwrap_or(i64::MAX);
+    let interval = PgInterval {
+        months: 0,
+        days: 0,
+        microseconds: micros,
+    };
     let res = sqlx::query(
         "UPDATE pgwq.jobs
-         SET status = 'awaiting_retry', last_error = $3, run_at = $4,
+         SET status = 'awaiting_retry', last_error = $3, run_at = now() + $4,
              lease_token = NULL, lease_expires_at = NULL
          WHERE id = $1 AND status = 'running' AND lease_token = $2",
     )
     .bind(id)
     .bind(lease_token)
     .bind(reason)
-    .bind(run_at)
+    .bind(interval)
     .execute(pool)
     .await?;
     Ok(res.rows_affected())

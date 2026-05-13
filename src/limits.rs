@@ -41,3 +41,17 @@ pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Purge function chunk size (rows per `DELETE ... LIMIT N` iteration).
 pub const PURGE_CHUNK_SIZE: usize = 10_000;
+
+/// Threshold of consecutive non-fatal `claim_batch` errors before escalation.
+///
+/// A persistent DB outage / TLS failure / network partition that doesn't
+/// classify as fatal under
+/// [`is_fatal_sqlx`](crate::__test_exports::is_fatal_sqlx) would otherwise
+/// keep the poll loop logging `warn!` indefinitely without any programmatic
+/// signal; once this many ticks fail in a row, the loop sets `last_fatal`
+/// and `ShutdownError::Fatal` surfaces through
+/// `WorkerHandle::{join, shutdown}`.
+///
+/// The counter resets on the first successful `claim_batch` (including
+/// empty-result success).
+pub const MAX_CONSECUTIVE_CLAIM_ERRORS: u32 = 30;
