@@ -175,19 +175,20 @@ where
         // pool starvation doesn't block cancel.
         let pool = state.pool.clone();
         let queue = state.queue.clone();
-        let mut tick_task: JoinHandle<Result<Vec<ReapedRow>, sqlx::Error>> = tokio::spawn(async move {
-            // Test-only panic injection — production callers leave the
-            // static at 0 (one Relaxed load per tick).
-            #[allow(clippy::panic)]
-            {
-                let pending = REAPER_PANIC_INJECTIONS.load(Ordering::Relaxed);
-                if pending > 0 {
-                    REAPER_PANIC_INJECTIONS.fetch_sub(1, Ordering::Relaxed);
-                    panic!("reaper test panic injection");
+        let mut tick_task: JoinHandle<Result<Vec<ReapedRow>, sqlx::Error>> =
+            tokio::spawn(async move {
+                // Test-only panic injection — production callers leave the
+                // static at 0 (one Relaxed load per tick).
+                #[allow(clippy::panic)]
+                {
+                    let pending = REAPER_PANIC_INJECTIONS.load(Ordering::Relaxed);
+                    if pending > 0 {
+                        REAPER_PANIC_INJECTIONS.fetch_sub(1, Ordering::Relaxed);
+                        panic!("reaper test panic injection");
+                    }
                 }
-            }
-            reap(&pool, &queue, REAPER_BATCH_SIZE).await
-        });
+                reap(&pool, &queue, REAPER_BATCH_SIZE).await
+            });
 
         // We poll `&mut tick_task` (not move) so that on the cancel arm
         // we still own the `JoinHandle` and can `.abort()` it. Dropping
