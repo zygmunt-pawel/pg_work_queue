@@ -114,10 +114,10 @@ impl From<sqlx::Error> for PushError {
         // worker-side classifier in later phases distinguishes finer-grained
         // fatal variants; for the push side, transient-or-constraint is the
         // axis users care about.
-        if let sqlx::Error::Database(db) = &e {
-            if db.code().as_deref().is_some_and(|c| c.starts_with("23")) {
-                return Self::Constraint(e);
-            }
+        if let sqlx::Error::Database(db) = &e
+            && db.code().as_deref().is_some_and(|c| c.starts_with("23"))
+        {
+            return Self::Constraint(e);
         }
         Self::Transient(e)
     }

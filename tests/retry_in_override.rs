@@ -53,12 +53,12 @@ async fn observe_first_retry_delay_seconds(pool: &sqlx::PgPool, queue: &str) -> 
         .expect("fetch");
         let s: String = row.try_get("s").expect("s");
         let last: Option<DateTime<Utc>> = row.try_get("last_attempted_at").expect("last");
-        if s == "awaiting_retry" {
-            if let Some(last_at) = last {
-                let run_at: DateTime<Utc> = row.try_get("run_at").expect("run_at");
-                let delta = run_at - last_at;
-                return delta.num_milliseconds() as f64 / 1000.0;
-            }
+        if s == "awaiting_retry"
+            && let Some(last_at) = last
+        {
+            let run_at: DateTime<Utc> = row.try_get("run_at").expect("run_at");
+            let delta = run_at - last_at;
+            return delta.num_milliseconds() as f64 / 1000.0;
         }
         if std::time::Instant::now() > deadline {
             panic!("timeout waiting for awaiting_retry; s={s}");

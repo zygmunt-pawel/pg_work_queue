@@ -656,10 +656,10 @@ where
         }
         // lease_timeout >= 5 × poll_interval — give the worker at least 5
         // poll cycles to complete mark_* before the reaper claws back.
-        if let Some(min_lease) = self.poll_interval.checked_mul(5) {
-            if self.lease_timeout < min_lease {
-                return Err(BuildError::LeaseTimeoutTooShort);
-            }
+        if let Some(min_lease) = self.poll_interval.checked_mul(5)
+            && self.lease_timeout < min_lease
+        {
+            return Err(BuildError::LeaseTimeoutTooShort);
         }
 
         // Pool: dedicated `PoolMissing` variant (replaces Faza 3's
@@ -1459,7 +1459,7 @@ where
                 // permits drop at end of scope. `into_iter()` on permits
                 // (not `drain`) — the Vec is consumed entirely here.
                 let mut tasks = state.tasks.lock().await;
-                for (row, permit) in rows.into_iter().zip(permits.into_iter()) {
+                for (row, permit) in rows.into_iter().zip(permits) {
                     let s = state.clone();
                     tasks.spawn(handle_job(row, s, permit));
                 }
