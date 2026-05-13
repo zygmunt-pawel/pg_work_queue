@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Runs `cargo deny check` against `deny.toml`. Default scope:
       # advisories, bans, licenses, sources. Each can be tuned in
       # `deny.toml`.
