@@ -262,88 +262,213 @@ impl<T> WorkerBuilder<T, JsonCodec, ()> {
 }
 
 impl<T, C, H> WorkerBuilder<T, C, H> {
-    /// Set the source queue name. Required.
+    /// Source queue name. **Required**.
+    ///
+    /// Validated on `build()`: non-empty and `≤ MAX_QUEUE_LEN` (64) chars.
+    /// Empty / oversize → [`BuildError::QueueNameInvalid`].
+    ///
+    /// **Observable effect**: the worker only claims rows whose `queue`
+    /// column matches this value (per-queue isolation; multiple workers
+    /// can share one DB with different queue names).
+    ///
+    /// See `tests/builder_validation.rs` and
+    /// `tests/reaper_per_queue_isolation.rs`.
     #[must_use]
     pub fn queue(mut self, q: impl Into<String>) -> Self {
         self.queue = Some(q.into());
         self
     }
 
-    /// Set the `sqlx::PgPool`. Required.
+    /// `sqlx::PgPool`. **Required**.
+    ///
+    /// The pool's `max_connections` must satisfy
+    /// `max_connections >= concurrency × 2 + 2` (each handler may hold
+    /// 1 conn for work + 1 for `mark_*`; +2 for the poll loop and reaper).
+    /// Read via `pool.options().get_max_connections()` (NOT `pool.size()`,
+    /// which is lazy and reports 0 for fresh pools). Failing this surfaces
+    /// [`BuildError::PoolTooSmall`].
+    ///
+    /// **Observable effect**: connection capacity for the whole worker.
+    /// Pool starvation manifests as `Stats::mark_timed_out` increments
+    /// (the `mark_*` SQL wrapper trips its timeout while waiting for an
+    /// acquire) and rows left in `'running'` that the reaper recovers.
+    ///
+    /// See `tests/builder_validation.rs` (`PoolTooSmall`) and
+    /// `tests/shutdown_immediate_with_pool_starvation.rs`.
     #[must_use]
     pub fn pool(mut self, pool: PgPool) -> Self {
         self.pool = Some(pool);
         self
     }
 
-    /// Set the per-row max attempts (≥ 1). Default: 3.
+    /// Per-row max attempts (`≥ 1`). Default: 3.
+    ///
+    /// The value is stamped on each row at claim time, so a rolling
+    /// deploy that changes `max_attempts` only affects newly-claimed
+    /// rows; in-flight rows keep the value the *claiming* worker stamped.
+    ///
+    /// **Observable effect**: number of retries before a failing job
+    /// transitions to `dead`. `attempts >= max_attempts` on a retry path
+    /// upgrades the transition to `mark_dead` (or, on the reaper path,
+    /// to `lease_expired_max_attempts`).
+    ///
+    /// `max_attempts == 0` → [`BuildError::MaxAttemptsZero`].
+    ///
+    /// See `tests/max_attempts_behavior.rs` and
+    /// `tests/max_attempts_rolling_deploy.rs`.
     #[must_use]
     pub const fn max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n;
         self
     }
 
-    /// Set the lease timeout (≥ 1s). Default: 30s.
+    /// Per-row lease deadline written to `lease_expires_at` at claim time.
+    /// Default: 30s. Floor: 1s.
+    ///
+    /// Cross-knob constraints (enforced by `build()`):
+    /// - `lease_timeout >= 5 × poll_interval` ([`BuildError::LeaseTimeoutTooShort`]).
+    /// - `lease_timeout >= 2s` so a valid `reaper_interval` exists
+    ///   ([`BuildError::LeaseTimeoutTooShortForReaper`]).
+    /// - `handler_timeout + 1s <= lease_timeout` ([`BuildError::HandlerTimeoutTooLong`]).
+    ///
+    /// **Observable effect**: process-death recovery threshold. If a
+    /// worker crashes mid-handler, the reaper flips the stale `running`
+    /// row no earlier than `now + lease_timeout`. Handler-level
+    /// cancellation goes through `handler_timeout`, **not** this knob.
+    ///
+    /// See `tests/lease_timeout_behavior.rs` and
+    /// `tests/stale_running_reaped.rs`.
     #[must_use]
     pub const fn lease_timeout(mut self, d: Duration) -> Self {
         self.lease_timeout = d;
         self
     }
 
-    /// Set the per-tick batch size (1..=1000). Default: 32.
+    /// Per-tick batch size (`1..=1000`). Default: 32.
+    ///
+    /// Out-of-range → [`BuildError::BatchSizeOutOfRange`].
+    ///
+    /// **Observable effect**: rows pulled per `claim_batch` invocation
+    /// (and hence per `TickStats::claimed`). Larger batches amortize
+    /// claim overhead at the cost of tail latency when a slow handler
+    /// stalls the per-tick sequential loop in `tick_once` (the
+    /// production poll loop is concurrent, so batching matters less
+    /// there).
+    ///
+    /// See `tests/batch_size_behavior.rs`.
     #[must_use]
     pub const fn batch_size(mut self, n: u32) -> Self {
         self.batch_size = n;
         self
     }
 
-    /// Set the retry backoff policy used when a `JobError::Retry` carries
-    /// no `retry_in` override. Default: [`BackoffPolicy::default()`] —
+    /// Retry backoff policy used when `JobError::Retry` carries no
+    /// `retry_in` override. Default: [`BackoffPolicy::default()`] —
     /// `Exponential { 1s, 2.0, 5min, 0.2 }`.
     ///
-    /// Validate'd przez `build()` (`BuildError::BackoffInvalid` na
-    /// nieprawidłowe params).
+    /// Validated on `build()`; invalid params → [`BuildError::BackoffInvalid`].
+    ///
+    /// **Observable effect**: the value written to `run_at` on the
+    /// retry path. Per-call `JobError::retry_in(...)` has priority and
+    /// is clamped to `[max(poll_interval, 100ms), 24h]`.
+    ///
+    /// See `tests/retry_backoff_behavior.rs`,
+    /// `tests/backoff_policy_unit.rs` and
+    /// `tests/retry_in_override.rs`.
     #[must_use]
     pub const fn retry_backoff(mut self, policy: BackoffPolicy) -> Self {
         self.retry_backoff = Some(policy);
         self
     }
 
-    /// Set the panic policy: `Retry` (synthesize a `JobError::Retry` and
-    /// route through backoff) or `Dead` (bypass retry budget, `mark_dead`
-    /// immediately). Default: [`PanicPolicy::Retry`].
+    /// What the library does when a handler panics. Default:
+    /// [`PanicPolicy::Retry`] — synthesize a `JobError::Retry` and route
+    /// through the configured backoff; [`PanicPolicy::Dead`] bypasses
+    /// the retry budget and goes straight to `mark_dead`.
+    ///
+    /// **Observable effect**: the terminal status of a panicking handler.
+    /// With `Retry`, the row reaches `dead` only after `attempts >=
+    /// max_attempts`; with `Dead`, the row is `dead` after the very
+    /// first panic.
+    ///
+    /// See `tests/panic_policy_behavior.rs`.
     #[must_use]
     pub const fn panic_policy(mut self, policy: PanicPolicy) -> Self {
         self.panic_policy = policy;
         self
     }
 
-    /// Poll interval — how often the poll loop wakes to call `claim_batch`.
+    /// Time between poll-loop ticks (`claim_batch` invocations).
     /// Default: 1s. Floor: [`crate::limits::MIN_POLL_INTERVAL`] (10ms).
+    ///
+    /// Below the floor → [`BuildError::PollIntervalTooShort`].
+    ///
+    /// **Observable effect**: pickup latency. A push committed at
+    /// `t = 0` is observable as `status = 'running'` no later than
+    /// `t + poll_interval` (modulo permit availability and the
+    /// "permits-first" rule — see `Worker::start`).
+    ///
+    /// See `tests/poll_interval_behavior.rs`.
     #[must_use]
     pub const fn poll_interval(mut self, d: Duration) -> Self {
         self.poll_interval = d;
         self
     }
 
-    /// Maximum number of concurrent handlers. Default: number of CPU cores
-    /// (clamped to a sane bound by the validated pool size).
+    /// Maximum number of concurrent handlers. Default: number of CPU cores.
+    ///
+    /// `0` → [`BuildError::ConcurrencyZero`]. Cross-knob: pool
+    /// `max_connections >= concurrency × 2 + 2` ([`BuildError::PoolTooSmall`]).
+    ///
+    /// **Observable effect**: the semaphore capacity gating handler
+    /// spawn. The poll loop acquires permits *before* `claim_batch` so
+    /// claim count never exceeds free permits (no spawn backlog).
+    ///
+    /// See `tests/concurrency_behavior.rs` and
+    /// `tests/poll_acquires_permits_before_claim.rs`.
     #[must_use]
     pub const fn concurrency(mut self, n: usize) -> Self {
         self.concurrency = Some(n);
         self
     }
 
-    /// Per-handler timeout. Default: `lease_timeout × 80%` (clamped to
-    /// [`crate::limits::MIN_HANDLER_TIMEOUT`]).
+    /// Per-handler wall-clock timeout. Default: `lease_timeout × 80%`,
+    /// clamped to [`crate::limits::MIN_HANDLER_TIMEOUT`] (1s).
+    ///
+    /// Cross-knob: `handler_timeout + 1s <= lease_timeout`
+    /// ([`BuildError::HandlerTimeoutTooLong`]) — `mark_retry` needs
+    /// margin to commit before the lease expires.
+    ///
+    /// **Observable effect**: the deadline at which the library drops
+    /// the handler future and routes the row to `mark_retry` with
+    /// `reason = "handler_timeout"`. `Stats::timed_out` counts these.
+    /// **Cancellation only fires at `.await` points** — CPU-bound work
+    /// without yields will not be cancelled; use `spawn_blocking` or
+    /// `tokio::task::yield_now()`.
+    ///
+    /// See `tests/handler_timeout_behavior.rs`.
     #[must_use]
     pub const fn handler_timeout(mut self, d: Duration) -> Self {
         self.handler_timeout = Some(d);
         self
     }
 
-    /// Per-mark SQL timeout. Default: `lease_timeout - handler_timeout - 1s`.
-    /// Floor: [`crate::limits::MIN_MARK_TIMEOUT`] (100ms).
+    /// Per-`mark_*` SQL timeout. Default:
+    /// `lease_timeout - handler_timeout - 1s`. Floor:
+    /// [`crate::limits::MIN_MARK_TIMEOUT`] (100ms).
+    /// Ceiling: `lease_timeout - handler_timeout`
+    /// ([`BuildError::MarkTimeoutTooLong`]).
+    ///
+    /// **Observable effect**: under pool starvation a `mark_*` may wait
+    /// seconds for a connection; this timeout caps that wait so the
+    /// lease can not expire mid-mark (which would fence the worker out
+    /// and cause a duplicate side-effect). Trip → `Stats::mark_timed_out`
+    /// increments, the row stays `'running'`, and the reaper recovers
+    /// it after lease expiry.
+    ///
+    /// See `tests/shutdown_immediate_with_pool_starvation.rs` for the
+    /// pool-starvation regression and `tests/builder_validation.rs` for
+    /// the cross-knob validation.
     #[must_use]
     pub const fn mark_timeout(mut self, d: Duration) -> Self {
         self.mark_timeout = Some(d);
@@ -351,17 +476,35 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
     }
 
     /// Reaper sweep interval — how often the reaper task wakes to flip
-    /// stale `running` rows. Default: `lease_timeout / 4`. Floor: 1s
-    /// ([`BuildError::ReaperIntervalTooShort`]). Ceiling: `lease_timeout / 2`
-    /// so the reaper ticks at least twice per lease
-    /// ([`BuildError::ReaperIntervalTooLong`]).
+    /// stale `running` rows. Default: `lease_timeout / 4`.
+    ///
+    /// Floor: 1s ([`BuildError::ReaperIntervalTooShort`]).
+    /// Ceiling: `lease_timeout / 2` so the reaper ticks at least twice
+    /// per lease ([`BuildError::ReaperIntervalTooLong`]).
+    ///
+    /// **Observable effect**: the worst-case latency between a worker
+    /// process crash and the orphaned row becoming claimable again.
+    /// The reaper is **only** for process-death recovery (crash, OOM,
+    /// network partition); handler-level cancellation goes through
+    /// `handler_timeout`, not this knob.
+    ///
+    /// See `tests/reaper_interval_behavior.rs` and
+    /// `tests/reaper_drains_backlog_adaptive.rs`.
     #[must_use]
     pub const fn reaper_interval(mut self, d: Duration) -> Self {
         self.reaper_interval = Some(d);
         self
     }
 
-    /// Swap the codec. Default: [`JsonCodec`].
+    /// Swap the payload codec. Default: [`JsonCodec`].
+    ///
+    /// **Observable effect**: how `payload BYTEA` is decoded before
+    /// being handed to the handler (and how it is encoded on the push
+    /// side via [`crate::Pusher::with_codec`]). The codec must be
+    /// symmetric with the pusher's codec for any given queue.
+    ///
+    /// See `tests/codec_swappable.rs` and
+    /// `tests/codec_decode_error_marks_dead.rs`.
     pub fn codec<C2: Codec>(self, codec: C2) -> WorkerBuilder<T, C2, H> {
         WorkerBuilder {
             pool: self.pool,
@@ -387,9 +530,28 @@ impl<T, C, H> WorkerBuilder<T, C, H>
 where
     T: 'static,
 {
-    /// Set the handler. Required. Accepts any
+    /// Job handler. **Required**.
+    ///
+    /// Accepts any
     /// `Fn(T, JobContext) -> impl Future<Output = Result<(), JobError>>`
-    /// that's `Send + Sync + 'static`.
+    /// that is `Send + Sync + 'static`. The library wraps each call in
+    /// `tokio::time::timeout(handler_timeout, _)` and runs it inside a
+    /// per-worker `JoinSet` for panic isolation and clean shutdown
+    /// cascade.
+    ///
+    /// **Observable effect**: `Ok(())` routes to `mark_done`;
+    /// `Err(JobError::Retry { .. })` routes to `mark_retry` (after
+    /// `attempts >= max_attempts` upgrade to `mark_dead`);
+    /// `Err(JobError::Abort { .. })` routes to `mark_dead` directly.
+    /// A panic is treated according to [`PanicPolicy`].
+    ///
+    /// `JobContext::idempotency_key` (a `uuidv7`) is **stable across
+    /// retries** for the same logical job — use it as the dedup key on
+    /// any external side-effect.
+    ///
+    /// See `tests/worker_tick_once_smoke.rs`,
+    /// `tests/at_least_once_semantics.rs` and
+    /// `tests/idempotency_key_stable_across_retries.rs`.
     pub fn handler<F, Fut>(self, f: F) -> WorkerBuilder<T, C, Arc<dyn JobHandler<T>>>
     where
         F: Fn(T, JobContext) -> Fut + Send + Sync + 'static,

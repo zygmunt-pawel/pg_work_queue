@@ -109,7 +109,7 @@ impl Default for BackoffPolicy {
 
 impl BackoffPolicy {
     /// Construct an `Exponential` policy with the supplied parameters.
-    /// Validate via [`BackoffPolicy::validate`] (the builder does this).
+    /// The builder validates parameters internally on `build()`.
     #[must_use]
     pub const fn exponential(base: Duration, factor: f64, cap: Duration, jitter: f64) -> Self {
         Self::Exponential {

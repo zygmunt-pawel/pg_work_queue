@@ -321,7 +321,7 @@ pub enum BuildError {
         lease: Duration,
     },
 
-    /// `BackoffPolicy` parameters fail [`BackoffPolicy::validate`] —
+    /// `BackoffPolicy` parameters fail validation —
     /// `factor`/`jitter`/`base`/`cap` out of supported ranges. See
     /// [`crate::backoff::BackoffPolicy`] for the contract.
     #[error("backoff policy invalid: {reason}")]
@@ -342,7 +342,7 @@ pub enum BuildError {
 #[non_exhaustive]
 pub enum StartError {
     /// `pgwq` schema is not present — operator must run
-    /// [`crate::migrator`] before calling `start`.
+    /// [`crate::migrator()`] before calling `start`.
     #[error("schema check failed (run pg_work_queue::migrator first?): {0}")]
     SchemaMissing(#[source] sqlx::Error),
     /// Any other `sqlx::Error` raised during the start-time probe (network,
@@ -390,8 +390,8 @@ pub enum ShutdownError {
     #[error("shutdown already called")]
     AlreadyShutdown,
 
-    /// Reaper task panicked `consecutive_panics` ticks in a row (≥
-    /// [`crate::reaper::REAPER_PANIC_ESCALATION_THRESHOLD`]) and self-cancelled
+    /// Reaper task panicked `consecutive_panics` ticks in a row (the
+    /// crate-internal escalation threshold) and self-cancelled
     /// the worker. No `sqlx::Error` is involved, so this is distinct from
     /// `Fatal`. Operators previously detected this only via
     /// `tracing::error!` events on `pgwq.reaper.escalation`.
