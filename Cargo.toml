@@ -2,7 +2,7 @@
 name = "pg_work_queue"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Minimal polling-based Postgres 18+ job queue with fencing tokens, per-row max_attempts, and at-least-once delivery semantics"
 repository = "https://github.com/pawel/pg_work_queue"

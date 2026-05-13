@@ -20,7 +20,7 @@ operation, no `LISTEN/NOTIFY`. Built around fencing tokens, per-row
 
 ## Status
 
-`v0.1` — pre-publish. Postgres **18+** (uses native `uuidv7()`), Rust 1.85+,
+`v0.1` — pre-publish. Postgres **18+** (uses native `uuidv7()`), Rust 1.88+,
 Tokio, MIT licensed.
 
 The crate has ~120 integration tests running against real Postgres 18 via

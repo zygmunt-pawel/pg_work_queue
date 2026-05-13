@@ -56,19 +56,21 @@ jobs:
       - run: cargo doc --no-deps --document-private-items
 
   msrv:
-    name: MSRV (1.85)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       # `cargo check --all-targets` exercises lib + tests for the pinned
       # MSRV from `package.rust-version` in Cargo.toml. We don't run the
       # full test suite on MSRV — that's covered by the `test` job.
-      - run: cargo check --all-targets --locked
+      # No `--locked`: Cargo.lock is gitignored (library convention),
+      # CI resolves fresh each run.
+      - run: cargo check --all-targets
 
   test:
     name: test (PG18 via testcontainers)
@@ -87,7 +89,8 @@ jobs:
         run: docker pull postgres:18
       # `--no-fail-fast` so a single flaky integration test doesn't mask
       # the rest. RUST_LOG kept terse (warn-level) to keep CI logs scannable.
+      # No `--locked`: Cargo.lock is gitignored (library convention).
       - name: cargo test
         env:
           RUST_LOG: warn,sqlx=warn,pg_work_queue=warn
-        run: cargo test --no-fail-fast --locked
+        run: cargo test --no-fail-fast

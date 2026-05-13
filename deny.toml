@@ -47,6 +47,10 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "CC0-1.0",
+    # `webpki-roots` (transitive via sqlx-tls) ships the Mozilla CA bundle
+    # under CDLA-Permissive-2.0. Linux Foundation permissive open-data
+    # license, OSI-permissive equivalent — safe to bundle.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 # Per-crate license overrides — empty by default; add only when a crate's
