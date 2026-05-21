@@ -74,6 +74,7 @@ pub mod worker;
 #[doc(hidden)]
 pub mod claim;
 pub(crate) mod job;
+pub(crate) mod key_slot;
 #[doc(hidden)]
 pub mod mark;
 pub(crate) mod reaper;
