@@ -27,6 +27,7 @@
     clippy::too_many_lines
 )]
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -47,7 +48,10 @@ use crate::backoff::{BackoffPolicy, PanicPolicy};
 use crate::codec::{Codec, JsonCodec};
 use crate::error::{BuildError, JobError, ShutdownError, StartError};
 use crate::job::{Job, JobContext};
-use crate::limits::{MAX_QUEUE_LEN, MIN_HANDLER_TIMEOUT, MIN_MARK_TIMEOUT, MIN_POLL_INTERVAL};
+use crate::limits::{
+    MAX_CONCURRENCY_KEY_LEN, MAX_QUEUE_LEN, MIN_HANDLER_TIMEOUT, MIN_MARK_TIMEOUT,
+    MIN_POLL_INTERVAL,
+};
 use crate::mark::{mark_dead, mark_done, mark_retry};
 use crate::reaper::MIN_REAPER_INTERVAL;
 use crate::transition::{TransitionCtx, TransitionSource, WorkerIdentity, emit_transition};
@@ -229,6 +233,7 @@ pub struct WorkerBuilder<T, C = JsonCodec, H = ()> {
     panic_policy: PanicPolicy,
     poll_interval: Duration,
     concurrency: Option<usize>,
+    concurrency_limits: HashMap<String, u32>,
     handler_timeout: Option<Duration>,
     mark_timeout: Option<Duration>,
     reaper_interval: Option<Duration>,
@@ -251,6 +256,7 @@ impl<T> WorkerBuilder<T, JsonCodec, ()> {
             panic_policy: PanicPolicy::default(),
             poll_interval: DEFAULT_POLL_INTERVAL,
             concurrency: None,
+            concurrency_limits: HashMap::new(),
             handler_timeout: None,
             mark_timeout: None,
             reaper_interval: None,
@@ -445,6 +451,40 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
         self
     }
 
+    /// Per-key concurrency limits — `key → max concurrently-running jobs`.
+    ///
+    /// A job carrying a `concurrency_key` (set via `Pusher::push`) present in
+    /// this map is limited to at most `limit` concurrently-running handler
+    /// tasks. A `None` key, or a key absent from this map, is unlimited.
+    ///
+    /// Accumulates across calls; a duplicate key takes the last value (a
+    /// `tracing::warn!` is emitted on overwrite at `build()` time).
+    ///
+    /// Validated on `build()`: each key `1..=MAX_CONCURRENCY_KEY_LEN`
+    /// characters → [`BuildError::ConcurrencyKeyInvalid`]; each limit
+    /// `1..=i32::MAX` → [`BuildError::ConcurrencyLimitInvalid`].
+    ///
+    /// **Single-instance only** — the limit is enforced via an in-process
+    /// counter. See the README "Per-key concurrency" section.
+    #[must_use]
+    pub fn concurrency_limits(
+        mut self,
+        limits: impl IntoIterator<Item = (String, u32)>,
+    ) -> Self {
+        for (k, v) in limits {
+            if let Some(prev) = self.concurrency_limits.insert(k.clone(), v) {
+                tracing::warn!(
+                    target: "pgwq.builder",
+                    key = %k,
+                    previous = prev,
+                    replacement = v,
+                    "concurrency_limits: duplicate key overwritten",
+                );
+            }
+        }
+        self
+    }
+
     /// Per-handler wall-clock timeout. Default: `lease_timeout × 80%`,
     /// clamped to [`crate::limits::MIN_HANDLER_TIMEOUT`] (1s).
     ///
@@ -553,6 +593,7 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
             panic_policy: self.panic_policy,
             poll_interval: self.poll_interval,
             concurrency: self.concurrency,
+            concurrency_limits: self.concurrency_limits,
             handler_timeout: self.handler_timeout,
             mark_timeout: self.mark_timeout,
             reaper_interval: self.reaper_interval,
@@ -605,6 +646,7 @@ where
             panic_policy: self.panic_policy,
             poll_interval: self.poll_interval,
             concurrency: self.concurrency,
+            concurrency_limits: self.concurrency_limits,
             handler_timeout: self.handler_timeout,
             mark_timeout: self.mark_timeout,
             reaper_interval: self.reaper_interval,
@@ -627,7 +669,7 @@ where
     /// fields are missing.
     pub fn build(self) -> Result<Worker<T, C>, BuildError> {
         let queue = self.queue.unwrap_or_default();
-        if queue.is_empty() || queue.len() > MAX_QUEUE_LEN {
+        if queue.is_empty() || queue.chars().count() > MAX_QUEUE_LEN {
             return Err(BuildError::QueueNameInvalid(queue));
         }
 
@@ -762,6 +804,20 @@ where
         let retry_backoff = self.retry_backoff.unwrap_or_default();
         retry_backoff.validate()?;
 
+        // Per-key concurrency limits validation.
+        for (key, &limit) in &self.concurrency_limits {
+            let key_len = key.chars().count();
+            if key_len == 0 || key_len > MAX_CONCURRENCY_KEY_LEN {
+                return Err(BuildError::ConcurrencyKeyInvalid(key.clone()));
+            }
+            if limit == 0 || limit > i32::MAX as u32 {
+                return Err(BuildError::ConcurrencyLimitInvalid {
+                    key: key.clone(),
+                    limit,
+                });
+            }
+        }
+
         Ok(Worker {
             pool,
             queue,
@@ -772,6 +828,7 @@ where
             panic_policy: self.panic_policy,
             poll_interval: self.poll_interval,
             concurrency,
+            concurrency_limits: self.concurrency_limits,
             handler_timeout,
             mark_timeout,
             reaper_interval,
@@ -813,6 +870,9 @@ pub struct Worker<T, C = JsonCodec> {
     panic_policy: PanicPolicy,
     poll_interval: Duration,
     concurrency: usize,
+    // consumed in Task 9 (per-key concurrency enforcement in the poll loop)
+    #[allow(dead_code)]
+    concurrency_limits: HashMap<String, u32>,
     handler_timeout: Duration,
     mark_timeout: Duration,
     reaper_interval: Duration,

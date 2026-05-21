@@ -335,6 +335,20 @@ pub enum BuildError {
         /// Static reason describing which constraint was violated.
         reason: &'static str,
     },
+
+    /// A `concurrency_limits` key is empty or exceeds
+    /// `limits::MAX_CONCURRENCY_KEY_LEN` characters.
+    #[error("concurrency_limits key invalid: {0:?}")]
+    ConcurrencyKeyInvalid(String),
+
+    /// A `concurrency_limits` value is outside `1..=i32::MAX`.
+    #[error("concurrency limit for key {key:?} must be in 1..=2147483647, got {limit}")]
+    ConcurrencyLimitInvalid {
+        /// The offending key.
+        key: String,
+        /// The offending limit value.
+        limit: u32,
+    },
 }
 
 /// Errors returned by [`crate::worker::Worker::start`].
