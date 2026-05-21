@@ -37,7 +37,7 @@ async fn scheduled_run_at_delays_pickup() {
     let mut tx = pool.begin().await.expect("tx");
     let scheduled_at = Utc::now() + chrono::Duration::seconds(2);
     pusher
-        .push_at(&mut tx, &Payload { seq: 1 }, scheduled_at)
+        .push_at(&mut tx, &Payload { seq: 1 }, scheduled_at, None)
         .await
         .expect("push_at");
     tx.commit().await.expect("commit");

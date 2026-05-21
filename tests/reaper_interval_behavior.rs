@@ -59,7 +59,7 @@ async fn fast_reaper_reaps_quickly() {
     let pusher = Pusher::new("fast_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");
@@ -130,11 +130,11 @@ async fn second_tick_latency_respects_reaper_interval() {
     let pusher = Pusher::new("itl_q");
     let mut tx = pool.begin().await.expect("tx");
     let id_a = pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push a");
     let id_b = pusher
-        .push(&mut tx, &Payload { seq: 2 })
+        .push(&mut tx, &Payload { seq: 2 }, None)
         .await
         .expect("push b");
     tx.commit().await.expect("commit");

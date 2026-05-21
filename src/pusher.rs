@@ -12,7 +12,9 @@ use uuid::Uuid;
 
 use crate::codec::{Codec, JsonCodec};
 use crate::error::PushError;
-use crate::limits::{MAX_BATCH_BYTES, MAX_BATCH_SIZE, MAX_PAYLOAD_BYTES, MAX_QUEUE_LEN};
+use crate::limits::{
+    MAX_BATCH_BYTES, MAX_BATCH_SIZE, MAX_CONCURRENCY_KEY_LEN, MAX_PAYLOAD_BYTES, MAX_QUEUE_LEN,
+};
 
 /// Push-side handle for a single queue. Holds queue name + codec; cheap to
 /// `clone()`. Use [`Pusher::with_codec`] to swap the codec (consumes self).
@@ -50,9 +52,21 @@ impl<C: Codec> Pusher<C> {
 
     /// Validate the queue name once per push call (fail-late per the API sketch).
     fn validate_queue(&self) -> Result<(), PushError> {
-        let len = self.queue.len();
+        let len = self.queue.chars().count();
         if len == 0 || len > MAX_QUEUE_LEN {
             return Err(PushError::QueueNameInvalid(self.queue.clone()));
+        }
+        Ok(())
+    }
+
+    /// Validate an optional `concurrency_key` — character count in
+    /// `1..=MAX_CONCURRENCY_KEY_LEN`. Called before the codec encode step.
+    fn validate_concurrency_key(key: Option<&str>) -> Result<(), PushError> {
+        if let Some(k) = key {
+            let len = k.chars().count();
+            if len == 0 || len > MAX_CONCURRENCY_KEY_LEN {
+                return Err(PushError::ConcurrencyKeyInvalid(k.to_string()));
+            }
         }
         Ok(())
     }
@@ -82,8 +96,12 @@ impl<C: Codec> Pusher<C> {
 
     /// Enqueue a single job. `run_at` defaults to `now()` server-side.
     ///
+    /// `concurrency_key` — optional per-key concurrency bucket. `None` =
+    /// unlimited. See the README "Per-key concurrency" section.
+    ///
     /// # Errors
     /// - [`PushError::QueueNameInvalid`] — queue is empty or too long.
+    /// - [`PushError::ConcurrencyKeyInvalid`] — key empty or too long.
     /// - [`PushError::Codec`] — codec rejected `payload`.
     /// - [`PushError::PayloadTooLarge`] — encoded size > `MAX_PAYLOAD_BYTES`.
     /// - [`PushError::Constraint`] / [`PushError::Transient`] — DB faults.
@@ -92,17 +110,22 @@ impl<C: Codec> Pusher<C> {
         &self,
         tx: &mut PgConnection,
         payload: &T,
+        concurrency_key: Option<&str>,
     ) -> Result<Uuid, PushError> {
         self.validate_queue()?;
+        Self::validate_concurrency_key(concurrency_key)?;
         let bytes = self.encode_one(payload, 0)?;
         let public_id = Uuid::now_v7();
-        // run_at = DB default now(). We don't pass it explicitly.
-        sqlx::query("INSERT INTO pgwq.jobs (queue, payload, public_id) VALUES ($1, $2, $3)")
-            .bind(&self.queue)
-            .bind(&bytes)
-            .bind(public_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO pgwq.jobs (queue, payload, public_id, concurrency_key)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&self.queue)
+        .bind(&bytes)
+        .bind(public_id)
+        .bind(concurrency_key)
+        .execute(&mut *tx)
+        .await?;
         Ok(public_id)
     }
 
@@ -116,18 +139,21 @@ impl<C: Codec> Pusher<C> {
         tx: &mut PgConnection,
         payload: &T,
         run_at: DateTime<Utc>,
+        concurrency_key: Option<&str>,
     ) -> Result<Uuid, PushError> {
         self.validate_queue()?;
+        Self::validate_concurrency_key(concurrency_key)?;
         let bytes = self.encode_one(payload, 0)?;
         let public_id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO pgwq.jobs (queue, payload, public_id, run_at)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO pgwq.jobs (queue, payload, public_id, run_at, concurrency_key)
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&self.queue)
         .bind(&bytes)
         .bind(public_id)
         .bind(run_at)
+        .bind(concurrency_key)
         .execute(&mut *tx)
         .await?;
         Ok(public_id)

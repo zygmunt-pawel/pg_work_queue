@@ -34,7 +34,7 @@ async fn idempotency_key_equals_public_id_across_retries() {
     let pusher = Pusher::new("idk_q");
     let mut tx = pool.begin().await.expect("tx");
     let pushed_id = pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

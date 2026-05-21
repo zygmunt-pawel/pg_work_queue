@@ -20,6 +20,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// and transient DB faults. Use [`PushError::is_retriable`] to decide whether
 /// a retry loop is justified.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum PushError {
     /// One payload exceeds `limits::MAX_PAYLOAD_BYTES`. `index` is the
     /// position within a batch (0 for single push).
@@ -60,6 +61,11 @@ pub enum PushError {
     /// Queue name violates `MAX_QUEUE_LEN` or is empty.
     #[error("queue name invalid: {0:?}")]
     QueueNameInvalid(String),
+
+    /// `concurrency_key` is empty or exceeds `limits::MAX_CONCURRENCY_KEY_LEN`
+    /// characters.
+    #[error("concurrency_key invalid: {0:?}")]
+    ConcurrencyKeyInvalid(String),
 
     /// Codec failed on a single `push`/`push_at`.
     #[error("codec error: {0}")]

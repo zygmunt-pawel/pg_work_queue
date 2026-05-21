@@ -31,7 +31,7 @@ async fn handler_invoked_at_least_twice_when_first_retry() {
     let pusher = Pusher::new("alo_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

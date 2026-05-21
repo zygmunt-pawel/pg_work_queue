@@ -31,7 +31,7 @@ async fn worker_on_alpha_does_not_reap_beta_queue() {
     let pusher = Pusher::new("beta");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

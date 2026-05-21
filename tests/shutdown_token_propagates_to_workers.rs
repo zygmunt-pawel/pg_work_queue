@@ -34,7 +34,7 @@ async fn parent_token_cancels_all_child_workers() {
         let pusher = Pusher::new(q);
         let mut tx = pool.begin().await.expect("tx");
         pusher
-            .push(&mut tx, &Payload { seq: 0 })
+            .push(&mut tx, &Payload { seq: 0 }, None)
             .await
             .expect("push");
         tx.commit().await.expect("commit");

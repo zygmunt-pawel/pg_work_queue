@@ -30,7 +30,7 @@ async fn run_with_max_attempts(expected_max: u32, queue: &'static str) {
     let pusher = Pusher::new(queue);
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

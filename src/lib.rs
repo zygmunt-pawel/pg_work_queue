@@ -42,7 +42,7 @@
 //!
 //! let mut tx = pool.begin().await?;
 //! let _id = Pusher::new("email_send")
-//!     .push(&mut tx, &EmailTask { to: "a@b".into(), body: "hi".into() })
+//!     .push(&mut tx, &EmailTask { to: "a@b".into(), body: "hi".into() }, None)
 //!     .await?;
 //! tx.commit().await?;
 //!

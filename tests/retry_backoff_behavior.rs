@@ -29,7 +29,7 @@ async fn push_one(pool: &sqlx::PgPool, queue: &str) {
     let pusher = Pusher::new(queue);
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

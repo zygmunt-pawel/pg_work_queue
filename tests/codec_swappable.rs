@@ -59,7 +59,7 @@ async fn pusher_with_custom_codec_writes_custom_bytes_to_db() {
 
     let pusher = Pusher::new("custom_q").with_codec(PrefixedJsonCodec);
     let mut tx = pool.begin().await.expect("tx");
-    let id = pusher.push(&mut tx, &"hello world").await.expect("push");
+    let id = pusher.push(&mut tx, &"hello world", None).await.expect("push");
     tx.commit().await.expect("commit");
 
     let row = sqlx::query("SELECT payload FROM pgwq.jobs WHERE public_id = $1")

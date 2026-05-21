@@ -41,7 +41,7 @@ async fn mark_queries_fenced_out_when_lease_token_drifted() {
     let pusher = Pusher::new("fence_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

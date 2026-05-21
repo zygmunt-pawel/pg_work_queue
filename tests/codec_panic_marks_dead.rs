@@ -111,7 +111,7 @@ async fn panic_in_codec_decode_is_isolated_and_marks_only_that_row_dead() {
     let pusher_ok = Pusher::new("ok_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher_ok
-        .push(&mut tx, &Payload { n: 42 })
+        .push(&mut tx, &Payload { n: 42 }, None)
         .await
         .expect("push ok");
     tx.commit().await.expect("commit");

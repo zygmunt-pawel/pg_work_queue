@@ -96,7 +96,7 @@ async fn happy_path_emits_transition_events() {
     let pusher = Pusher::new("trc_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

@@ -37,7 +37,7 @@ async fn batch_push_is_at_least_5x_faster_than_per_row_push() {
     for i in 0..N {
         let mut tx = pool.begin().await.expect("tx");
         pusher
-            .push(&mut tx, &Tiny { seq: i as u32 })
+            .push(&mut tx, &Tiny { seq: i as u32 }, None)
             .await
             .expect("push");
         tx.commit().await.expect("commit");

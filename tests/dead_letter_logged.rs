@@ -96,7 +96,7 @@ async fn dead_letter_emits_error_transition_event() {
     let pusher = Pusher::new("dl_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

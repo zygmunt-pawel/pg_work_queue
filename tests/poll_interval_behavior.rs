@@ -78,11 +78,11 @@ async fn fast_poll_picks_up_faster_than_slow_poll() {
     let pusher_slow = Pusher::new("slow_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher_fast
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .unwrap();
     pusher_slow
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .unwrap();
     tx.commit().await.expect("commit");

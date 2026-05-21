@@ -30,7 +30,7 @@ async fn handler_always_retries_dies_after_max_attempts() {
     let pusher = Pusher::new("ma_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

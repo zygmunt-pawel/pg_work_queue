@@ -34,7 +34,7 @@ async fn stale_running_row_flipped_to_awaiting_retry() {
     let pusher = Pusher::new("stale_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

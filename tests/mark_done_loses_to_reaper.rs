@@ -40,7 +40,7 @@ async fn mark_done_lost_race_counted_as_fenced_out() {
     let pusher = Pusher::new("race_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 7 })
+        .push(&mut tx, &Payload { seq: 7 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");

@@ -40,7 +40,7 @@ async fn shutdown_cascade_aborts_handler_no_post_sleep_side_effect() {
     let pusher = Pusher::new("no_leak_q");
     let mut tx = pool.begin().await.expect("tx");
     pusher
-        .push(&mut tx, &Payload { seq: 1 })
+        .push(&mut tx, &Payload { seq: 1 }, None)
         .await
         .expect("push");
     tx.commit().await.expect("commit");
