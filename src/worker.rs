@@ -458,7 +458,8 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
     /// tasks. A `None` key, or a key absent from this map, is unlimited.
     ///
     /// Accumulates across calls; a duplicate key takes the last value (a
-    /// `tracing::warn!` is emitted on overwrite at `build()` time).
+    /// `tracing::warn!` is emitted on overwrite immediately, at the point of
+    /// the `.concurrency_limits()` call).
     ///
     /// Validated on `build()`: each key `1..=MAX_CONCURRENCY_KEY_LEN`
     /// characters → [`BuildError::ConcurrencyKeyInvalid`]; each limit
