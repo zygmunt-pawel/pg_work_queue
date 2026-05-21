@@ -13,6 +13,8 @@ mod common;
 use common::pg18_pool;
 use pg_work_queue::{JobContext, JobError, Pusher, Worker};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
@@ -27,7 +29,7 @@ async fn fresh_worker_ignores_ghost_running_rows() {
              (queue, payload, status, concurrency_key, attempts, max_attempts,
               last_attempted_at, first_attempted_at, lease_token, lease_expires_at)
          VALUES ('q', '\\x00', 'running', 'k', 1, 3,
-                 now(), now(), gen_random_uuid(), now() - interval '1 hour')",
+                 now(), now(), gen_random_uuid(), now() + interval '1 hour')",
     )
     .execute(&pool)
     .await
@@ -39,11 +41,27 @@ async fn fresh_worker_ignores_ghost_running_rows() {
     Pusher::new("q").push_batch(&mut tx, &items).await.unwrap();
     tx.commit().await.unwrap();
 
+    let now_counter = Arc::new(AtomicU32::new(0));
+    let peak_counter = Arc::new(AtomicU32::new(0));
+    let done_counter = Arc::new(AtomicU32::new(0));
+    let (now_c, peak_c, done_c) = (now_counter.clone(), peak_counter.clone(), done_counter.clone());
+
     let handle = Worker::<T>::builder()
         .pool(pool.clone())
         .queue("q")
+        .concurrency(4)
         .concurrency_limits([("k".to_string(), 2u32)])
-        .handler(|_t: T, _c: JobContext| async { Ok::<(), JobError>(()) })
+        .handler(move |_t: T, _c: JobContext| {
+            let (now_c, peak_c, done_c) = (now_c.clone(), peak_c.clone(), done_c.clone());
+            async move {
+                let now = now_c.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_c.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                now_c.fetch_sub(1, Ordering::SeqCst);
+                done_c.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), JobError>(())
+            }
+        })
         .build()
         .unwrap()
         .start()
@@ -60,4 +78,10 @@ async fn fresh_worker_ignores_ghost_running_rows() {
     .await
     .unwrap();
     assert_eq!(done, 2, "ghost running row must not block fresh claims");
+
+    let peak = peak_counter.load(Ordering::SeqCst);
+    assert!(
+        peak >= 2,
+        "peak in-flight for key 'k' was {peak}; expected 2 — ghost row must not consume in-memory headroom"
+    );
 }

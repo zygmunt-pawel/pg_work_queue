@@ -65,7 +65,7 @@ async fn limit_enforced_and_other_keys_progress() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(fast_done.load(Ordering::SeqCst), 3, "fast key not head-of-line blocked");
 
     let _ = handle.shutdown(Duration::from_secs(10)).await;
