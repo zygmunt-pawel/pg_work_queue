@@ -1054,7 +1054,7 @@ where
                 // initialized to 0 so headroom/acquire never hit a missing key.
                 let initial: HashMap<String, u32> =
                     self.concurrency_limits.keys().map(|k| (k.clone(), 0)).collect();
-                std::sync::Arc::new(std::sync::Mutex::new(initial))
+                Arc::new(std::sync::Mutex::new(initial))
             },
             concurrency_limits: self.concurrency_limits,
             shutdown: self.shutdown_token.unwrap_or_default(),
@@ -1583,8 +1583,11 @@ where
         //
         // Per-tick headroom snapshot: limit − live-task count, per configured
         // key. The map always contains every configured key (headroom >= 0).
-        // Poisoned mutex (unreachable — counter critical sections are
-        // panic-free): fall back to empty -> claim_batch fast path.
+        // Poisoned mutex (unreachable in practice — counter critical sections are
+        // panic-free, so the mutex cannot actually be poisoned): fall back to
+        // empty headroom map, which skips per-key limit enforcement for this tick
+        // (jobs may be claimed past their per-key concurrency limit) and lets
+        // claim_batch proceed on the global semaphore headroom alone.
         let headroom: std::collections::HashMap<String, u32> = state
             .concurrency_running
             .lock()
@@ -1696,6 +1699,8 @@ async fn handle_job<T, C>(
     job: Job<T>,
     state: Arc<WorkerState<T, C>>,
     _permit: OwnedSemaphorePermit,
+    // _slot: held for the task's lifetime; its Drop decrements the per-key concurrency counter on
+    // every exit (normal return, panic, or shutdown abort).
     _slot: crate::key_slot::KeySlotGuard,
 ) where
     T: Send + 'static,
