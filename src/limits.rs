@@ -15,6 +15,11 @@ pub const MAX_BATCH_SIZE: usize = 10_000;
 /// Max queue name length. Matches `jobs_queue_max_len` DB CHECK.
 pub const MAX_QUEUE_LEN: usize = 64;
 
+/// Max length of a job's concurrency key, in **character** units
+/// (Postgres `length(TEXT)`). Matches the `jobs_concurrency_key_len` DB
+/// CHECK. Validated character-wise on the push and builder sides.
+pub const MAX_CONCURRENCY_KEY_LEN: usize = 128;
+
 /// Max length of `last_error` text (character units — Postgres `length(TEXT)`).
 /// Library truncates at this; DB CHECK backstops.
 pub const MAX_LAST_ERROR_LEN: usize = 8 * 1024; // 8 KiB chars
