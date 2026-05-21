@@ -159,40 +159,42 @@ impl<C: Codec> Pusher<C> {
         Ok(public_id)
     }
 
-    /// Enqueue many jobs in a single round-trip. Returns `Vec<Uuid>` in
-    /// **input order** (client-side `Uuid::now_v7()` per item — no
-    /// `RETURNING`, per PLAN.md §"Batch push").
+    /// Enqueue many jobs in a single round-trip. Each item is a
+    /// `(payload, concurrency_key)` pair. Returns `Vec<Uuid>` in **input
+    /// order** (client-side `Uuid::now_v7()` per item — no `RETURNING`).
     ///
     /// # Errors
-    /// - [`PushError::BatchEmpty`] — `payloads.is_empty()`.
-    /// - [`PushError::BatchTooLarge`] — `payloads.len() > MAX_BATCH_SIZE`.
+    /// - [`PushError::BatchEmpty`] — `items.is_empty()`.
+    /// - [`PushError::BatchTooLarge`] — `items.len() > MAX_BATCH_SIZE`.
+    /// - [`PushError::ConcurrencyKeyInvalid`] — an item's key is out of range.
     /// - [`PushError::PayloadTooLarge`] — one payload exceeds `MAX_PAYLOAD_BYTES`.
     /// - [`PushError::BatchPayloadTooLarge`] — total bytes exceed `MAX_BATCH_BYTES`.
     /// - [`PushError::BatchCodec`] — codec rejected an item.
     /// - [`PushError::QueueNameInvalid`].
     /// - DB faults (`Constraint`/`Transient`).
-    #[tracing::instrument(skip(self, tx, payloads), fields(queue = %self.queue, count = payloads.len()))]
+    #[tracing::instrument(skip(self, tx, items), fields(queue = %self.queue, count = items.len()))]
     pub async fn push_batch<T: Serialize + Sync>(
         &self,
         tx: &mut PgConnection,
-        payloads: &[T],
+        items: &[(T, Option<String>)],
     ) -> Result<Vec<Uuid>, PushError> {
         self.validate_queue()?;
-        if payloads.is_empty() {
+        if items.is_empty() {
             return Err(PushError::BatchEmpty);
         }
-        if payloads.len() > MAX_BATCH_SIZE {
+        if items.len() > MAX_BATCH_SIZE {
             return Err(PushError::BatchTooLarge {
-                size: payloads.len(),
+                size: items.len(),
                 max: MAX_BATCH_SIZE,
             });
         }
 
-        // Short-circuited encode loop: bail on first oversize item / aggregate.
-        let mut payload_bytes: Vec<Vec<u8>> = Vec::with_capacity(payloads.len());
+        let mut payload_bytes: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        let mut keys: Vec<Option<String>> = Vec::with_capacity(items.len());
         let mut total_bytes: usize = 0;
-        for (i, p) in payloads.iter().enumerate() {
-            let bytes = self.encode_one(p, i)?;
+        for (i, (payload, key)) in items.iter().enumerate() {
+            Self::validate_concurrency_key(key.as_deref())?;
+            let bytes = self.encode_one(payload, i)?;
             total_bytes = total_bytes.saturating_add(bytes.len());
             if total_bytes > MAX_BATCH_BYTES {
                 return Err(PushError::BatchPayloadTooLarge {
@@ -201,21 +203,21 @@ impl<C: Codec> Pusher<C> {
                 });
             }
             payload_bytes.push(bytes);
+            keys.push(key.clone());
         }
 
-        // Client-side public_id generation — uuidv7 gives time-ordered B-tree
-        // locality + identical order to `payloads` input. We return these
-        // unchanged; DB row order does NOT participate.
-        let public_ids: Vec<Uuid> = (0..payloads.len()).map(|_| Uuid::now_v7()).collect();
+        let public_ids: Vec<Uuid> = (0..items.len()).map(|_| Uuid::now_v7()).collect();
 
         let result = sqlx::query(
-            "INSERT INTO pgwq.jobs (queue, payload, public_id)
-             SELECT $1, payload, public_id
-             FROM unnest($2::bytea[], $3::uuid[]) AS u(payload, public_id)",
+            "INSERT INTO pgwq.jobs (queue, payload, public_id, concurrency_key)
+             SELECT $1, payload, public_id, concurrency_key
+             FROM unnest($2::bytea[], $3::uuid[], $4::text[])
+                  AS u(payload, public_id, concurrency_key)",
         )
         .bind(&self.queue)
         .bind(&payload_bytes)
         .bind(&public_ids)
+        .bind(&keys)
         .execute(&mut *tx)
         .await?;
 

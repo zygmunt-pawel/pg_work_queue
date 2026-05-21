@@ -28,7 +28,7 @@ struct Payload {
 async fn shutdown_timeout_aborts_inflight_handlers() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("abort_q");
-    let payloads: Vec<Payload> = (0..3u32).map(|i| Payload { seq: i }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..3u32).map(|i| (Payload { seq: i }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

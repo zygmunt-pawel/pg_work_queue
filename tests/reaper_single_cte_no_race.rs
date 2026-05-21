@@ -29,7 +29,7 @@ async fn no_row_with_running_and_null_lease_token() {
     let (pool, _c) = common::pg18_pool().await;
 
     let pusher = Pusher::new("cte_q");
-    let payloads: Vec<Payload> = (0..100u32).map(|seq| Payload { seq }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..100u32).map(|seq| (Payload { seq }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

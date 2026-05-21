@@ -30,7 +30,7 @@ async fn no_advisory_locks_after_workers_drain_queue() {
 
     // Push 50 jobs.
     let pusher = Pusher::new("lock_q");
-    let payloads: Vec<Payload> = (0..50u32).map(|seq| Payload { seq }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..50u32).map(|seq| (Payload { seq }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

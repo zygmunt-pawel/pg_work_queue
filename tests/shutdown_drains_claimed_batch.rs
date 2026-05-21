@@ -29,7 +29,7 @@ struct Payload {
 async fn cancel_after_claim_still_drains_batch_to_terminal() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("drain_q");
-    let payloads: Vec<Payload> = (0..5u32).map(|i| Payload { seq: i }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..5u32).map(|i| (Payload { seq: i }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

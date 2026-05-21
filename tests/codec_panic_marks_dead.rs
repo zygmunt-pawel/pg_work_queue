@@ -55,7 +55,11 @@ async fn panic_in_codec_decode_is_isolated_and_marks_only_that_row_dead() {
 
     // Push 3 jobs via real JsonCodec (so payload bytes are valid JSON).
     let pusher = Pusher::new("panic_q");
-    let payloads = vec![Payload { n: 1 }, Payload { n: 2 }, Payload { n: 3 }];
+    let payloads: Vec<(Payload, Option<String>)> = vec![
+        (Payload { n: 1 }, None),
+        (Payload { n: 2 }, None),
+        (Payload { n: 3 }, None),
+    ];
     let mut tx = pool.begin().await.expect("tx");
     pusher.push_batch(&mut tx, &payloads).await.expect("push");
     tx.commit().await.expect("commit");

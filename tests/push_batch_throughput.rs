@@ -45,7 +45,7 @@ async fn batch_push_is_at_least_5x_faster_than_per_row_push() {
     let per_row = t0.elapsed();
 
     // -------- batch push (1 transaction) --------
-    let payloads: Vec<Tiny> = (0..N).map(|i| Tiny { seq: i as u32 }).collect();
+    let payloads: Vec<(Tiny, Option<String>)> = (0..N).map(|i| (Tiny { seq: i as u32 }, None)).collect();
     let t1 = Instant::now();
     let mut tx = pool.begin().await.expect("tx");
     let ids = pusher

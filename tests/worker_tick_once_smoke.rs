@@ -34,7 +34,7 @@ async fn tick_once_happy_path_marks_all_done() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("smoke_q");
 
-    let payloads: Vec<Payload> = (0..3u32).map(|id| Payload { id }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..3u32).map(|id| (Payload { id }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

@@ -35,7 +35,7 @@ struct WithSeq {
 async fn push_batch_preserves_input_order_in_db_and_in_returned_uuids() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("order_q");
-    let payloads: Vec<WithSeq> = (0..50u32).map(|seq| WithSeq { seq }).collect();
+    let payloads: Vec<(WithSeq, Option<String>)> = (0..50u32).map(|seq| (WithSeq { seq }, None)).collect();
 
     let mut tx = pool.begin().await.expect("tx");
     let returned_ids = pusher

@@ -92,7 +92,7 @@ async fn reaper_emits_one_transition_per_reaped_row() {
 
     // Push 5 jobs (2 for retry, 3 for dead).
     let pusher = Pusher::new("rt_q");
-    let payloads: Vec<Payload> = (0..5u32).map(|seq| Payload { seq }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..5u32).map(|seq| (Payload { seq }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     let ids = pusher
         .push_batch(&mut tx, &payloads)

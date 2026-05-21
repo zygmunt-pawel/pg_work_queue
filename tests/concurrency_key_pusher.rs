@@ -103,3 +103,29 @@ async fn push_with_multibyte_key_at_limit_accepted() {
         .expect("push at char limit should succeed");
     tx.commit().await.expect("commit");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_batch_carries_per_item_keys_in_order() {
+    let (pool, _c) = pg18_pool().await;
+    let mut tx = pool.begin().await.unwrap();
+    let items: Vec<(T, Option<String>)> = vec![
+        (T { n: 0 }, Some("a".to_string())),
+        (T { n: 1 }, None),
+        (T { n: 2 }, Some("b".to_string())),
+    ];
+    let ids = Pusher::new("q").push_batch(&mut tx, &items).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(ids.len(), 3);
+
+    for (id, expected) in ids.iter().zip(["a", "", "b"]) {
+        let key: Option<String> = sqlx::query_scalar(
+            "SELECT concurrency_key FROM pgwq.jobs WHERE public_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let want = if expected.is_empty() { None } else { Some(expected.to_string()) };
+        assert_eq!(key, want);
+    }
+}

@@ -36,7 +36,7 @@ struct Payload {
 async fn claim_batch_szanuje_skip_locked_pod_zrownoleglonym_dostepem() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("q1");
-    let payloads: Vec<Payload> = (0..100u32).map(|seq| Payload { seq }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..100u32).map(|seq| (Payload { seq }, None)).collect();
 
     let mut tx = pool.begin().await.expect("tx");
     pusher

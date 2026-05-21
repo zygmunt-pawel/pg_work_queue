@@ -30,7 +30,7 @@ async fn reaper_drains_5k_backlog_within_8s() {
     let pusher = Pusher::new("drain_q");
 
     // Push 5000 rows via push_batch (single call within MAX_BATCH_SIZE=10k).
-    let payloads: Vec<Payload> = (0..5000u32).map(|seq| Payload { seq }).collect();
+    let payloads: Vec<(Payload, Option<String>)> = (0..5000u32).map(|seq| (Payload { seq }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

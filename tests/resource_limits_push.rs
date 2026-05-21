@@ -57,7 +57,7 @@ async fn empty_batch_returns_batch_empty() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("q");
     let mut tx = pool.begin().await.expect("tx");
-    let empty: Vec<u32> = vec![];
+    let empty: Vec<(u32, Option<String>)> = vec![];
     let err = pusher
         .push_batch(&mut tx, &empty)
         .await
@@ -70,7 +70,7 @@ async fn batch_over_max_size_returns_batch_too_large() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("q");
     // 10_001 tiny payloads — fails on size check BEFORE encode loop.
-    let payloads: Vec<u32> = vec![0; MAX_BATCH_SIZE + 1];
+    let payloads: Vec<(u32, Option<String>)> = vec![(0u32, None); MAX_BATCH_SIZE + 1];
     let mut tx = pool.begin().await.expect("tx");
     let err = pusher
         .push_batch(&mut tx, &payloads)
@@ -90,14 +90,14 @@ async fn batch_item_index_three_oversize_reports_index_three() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("q");
     // Items 0..3 small, item 3 oversize.
-    let mut items: Vec<Bag> = (0..3)
-        .map(|_| Bag {
+    let mut items: Vec<(Bag, Option<String>)> = (0..3)
+        .map(|_| (Bag {
             blob: vec![0u8; 100],
-        })
+        }, None))
         .collect();
-    items.push(Bag {
+    items.push((Bag {
         blob: vec![0u8; MAX_PAYLOAD_BYTES + 1024],
-    });
+    }, None));
     let mut tx = pool.begin().await.expect("tx");
     let err = pusher
         .push_batch(&mut tx, &items)
@@ -130,7 +130,7 @@ async fn batch_aggregate_over_max_bytes_returns_batch_payload_too_large() {
     // Prościej: items są dużych ale-mieszczących-się Strings ≈ 800 KiB JSON
     // encoded (raw String + quoting ~ raw + 2 bytes). 90 × 800 KiB = 72 MiB > 64 MiB.
     let one_item = "x".repeat(800 * 1024);
-    let items: Vec<String> = (0..90).map(|_| one_item.clone()).collect();
+    let items: Vec<(String, Option<String>)> = (0..90).map(|_| (one_item.clone(), None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     let err = pusher
         .push_batch(&mut tx, &items)
