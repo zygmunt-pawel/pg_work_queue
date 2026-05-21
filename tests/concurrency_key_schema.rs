@@ -11,7 +11,7 @@ mod common;
 
 use common::pg18_pool;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrency_key_column_and_objects_present() {
     let (pool, _container) = pg18_pool().await;
 
@@ -36,7 +36,7 @@ async fn concurrency_key_column_and_objects_present() {
         .bind(idx)
         .fetch_one(&pool)
         .await
-        .unwrap();
+        .expect("index existence query must succeed");
         assert!(exists, "index {idx} must exist");
     }
 
@@ -47,7 +47,7 @@ async fn concurrency_key_column_and_objects_present() {
     )
     .fetch_one(&pool)
     .await
-    .unwrap();
+    .expect("constraint existence query must succeed");
     assert!(check_exists, "jobs_concurrency_key_len CHECK must exist");
 
     // Immutability trigger exists.
@@ -57,6 +57,46 @@ async fn concurrency_key_column_and_objects_present() {
     )
     .fetch_one(&pool)
     .await
-    .unwrap();
+    .expect("trigger existence query must succeed");
     assert!(trigger_exists, "immutability trigger must exist");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_concurrency_key_rejected_by_check() {
+    let (pool, _container) = pg18_pool().await;
+    let res = sqlx::query(
+        "INSERT INTO pgwq.jobs (queue, payload, concurrency_key) VALUES ('q', $1, $2)",
+    )
+    .bind(b"\x00" as &[u8])
+    .bind("")
+    .execute(&pool)
+    .await;
+    let err = res.expect_err("empty concurrency_key must be rejected");
+    assert_sqlstate_23(&err);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrency_key_over_128_chars_rejected_by_check() {
+    let (pool, _container) = pg18_pool().await;
+    let long_key: String = "x".repeat(129);
+    let res = sqlx::query(
+        "INSERT INTO pgwq.jobs (queue, payload, concurrency_key) VALUES ('q', $1, $2)",
+    )
+    .bind(b"\x00" as &[u8])
+    .bind(&long_key)
+    .execute(&pool)
+    .await;
+    let err = res.expect_err("129-char concurrency_key must be rejected");
+    assert_sqlstate_23(&err);
+}
+
+fn assert_sqlstate_23(err: &sqlx::Error) {
+    let sqlx::Error::Database(db) = err else {
+        panic!("expected database error, got {err:?}");
+    };
+    let code = db.code().expect("sqlstate present");
+    assert!(
+        code.starts_with("23"),
+        "expected SQLSTATE 23xxx (integrity constraint), got {code}: {err:?}"
+    );
 }
