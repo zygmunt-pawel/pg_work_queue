@@ -19,14 +19,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Shared per-key live-task counter.
-// wired into the Worker in Task 9
-#[allow(dead_code)]
 pub(crate) type ConcurrencyCounter = Arc<Mutex<HashMap<String, u32>>>;
 
 /// Owns one per-key slot. Increments on `acquire`, decrements on `Drop`.
 /// A no-op for jobs without a configured-limit key (`none()`).
-// wired into the Worker in Task 9
-#[allow(dead_code)]
 pub(crate) struct KeySlotGuard {
     slot: Option<(ConcurrencyCounter, String)>,
 }
@@ -35,8 +31,6 @@ impl KeySlotGuard {
     /// Increment the counter for `key` and return a guard owning that slot.
     /// On a poisoned mutex (unreachable — the critical section is panic-free)
     /// returns a slot-less guard: increment succeeded iff the guard owns a slot.
-    // wired into the Worker in Task 9
-    #[allow(dead_code)]
     pub(crate) fn acquire(counter: ConcurrencyCounter, key: String) -> Self {
         let ok = match counter.lock() {
             Ok(mut map) => {
@@ -56,8 +50,6 @@ impl KeySlotGuard {
     }
 
     /// A guard owning no slot — for unkeyed / unconfigured-key jobs.
-    // wired into the Worker in Task 9
-    #[allow(dead_code)]
     pub(crate) const fn none() -> Self {
         Self { slot: None }
     }

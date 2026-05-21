@@ -871,8 +871,6 @@ pub struct Worker<T, C = JsonCodec> {
     panic_policy: PanicPolicy,
     poll_interval: Duration,
     concurrency: usize,
-    // consumed in Task 9 (per-key concurrency enforcement in the poll loop)
-    #[allow(dead_code)]
     concurrency_limits: HashMap<String, u32>,
     handler_timeout: Duration,
     mark_timeout: Duration,
@@ -1048,6 +1046,17 @@ where
             poll_interval: self.poll_interval,
             reaper_interval: self.reaper_interval,
             semaphore: Arc::new(Semaphore::new(self.concurrency)),
+            concurrency_running: {
+                // No DB seed — the counter tracks THIS process's live handler
+                // tasks, which is zero at startup. `running` rows left by a
+                // crashed prior process are dead ghosts that consume nothing;
+                // the reaper reclaims them. Every configured key is
+                // initialized to 0 so headroom/acquire never hit a missing key.
+                let initial: HashMap<String, u32> =
+                    self.concurrency_limits.keys().map(|k| (k.clone(), 0)).collect();
+                std::sync::Arc::new(std::sync::Mutex::new(initial))
+            },
+            concurrency_limits: self.concurrency_limits,
             shutdown: self.shutdown_token.unwrap_or_default(),
             tasks: Mutex::new(JoinSet::new()),
             stats: AtomicStats::default(),
@@ -1094,6 +1103,8 @@ pub(crate) struct WorkerState<T, C> {
     pub(crate) poll_interval: Duration,
     pub(crate) reaper_interval: Duration,
     pub(crate) semaphore: Arc<Semaphore>,
+    pub(crate) concurrency_limits: HashMap<String, u32>,
+    pub(crate) concurrency_running: crate::key_slot::ConcurrencyCounter,
     pub(crate) shutdown: CancellationToken,
     pub(crate) tasks: Mutex<JoinSet<()>>,
     pub(crate) stats: AtomicStats,
@@ -1568,8 +1579,28 @@ where
         // Wrap the claim await in select! — otherwise pool starvation
         // (sqlx acquire_timeout 30s default) blocks shutdown beyond cancel.
         // `headroom` is bound here (not inline) so the temporary outlives the
-        // `select!` future. Task 9 replaces this with a real headroom map.
-        let headroom: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        // `select!` future.
+        //
+        // Per-tick headroom snapshot: limit − live-task count, per configured
+        // key. The map always contains every configured key (headroom >= 0).
+        // Poisoned mutex (unreachable — counter critical sections are
+        // panic-free): fall back to empty -> claim_batch fast path.
+        let headroom: std::collections::HashMap<String, u32> = state
+            .concurrency_running
+            .lock()
+            .map_or_else(
+                |_| std::collections::HashMap::new(),
+                |counts| {
+                    state
+                        .concurrency_limits
+                        .iter()
+                        .map(|(k, &limit)| {
+                            let used = counts.get(k).copied().unwrap_or(0);
+                            (k.clone(), limit.saturating_sub(used))
+                        })
+                        .collect()
+                },
+            );
         let claim_result = tokio::select! {
             r = crate::claim::claim_and_decode::<T, C>(
                 &state.pool,
@@ -1601,7 +1632,16 @@ where
                 let mut tasks = state.tasks.lock().await;
                 for (row, permit) in rows.into_iter().zip(permits) {
                     let s = state.clone();
-                    tasks.spawn(handle_job(row, s, permit));
+                    let slot = match &row.concurrency_key {
+                        Some(k) if state.concurrency_limits.contains_key(k) => {
+                            crate::key_slot::KeySlotGuard::acquire(
+                                state.concurrency_running.clone(),
+                                k.clone(),
+                            )
+                        }
+                        _ => crate::key_slot::KeySlotGuard::none(),
+                    };
+                    tasks.spawn(handle_job(row, s, permit, slot));
                 }
                 // `permits` cannot be reused after `into_iter()`. We
                 // explicitly bind a fresh empty Vec for the next iteration
@@ -1652,8 +1692,12 @@ where
 /// `tokio::spawn` would leak the inner handler future under outer
 /// `abort_all` (Anti-pattern #12) — `JoinSet::drop` aborts pending tasks
 /// so cascade works correctly.
-async fn handle_job<T, C>(job: Job<T>, state: Arc<WorkerState<T, C>>, _permit: OwnedSemaphorePermit)
-where
+async fn handle_job<T, C>(
+    job: Job<T>,
+    state: Arc<WorkerState<T, C>>,
+    _permit: OwnedSemaphorePermit,
+    _slot: crate::key_slot::KeySlotGuard,
+) where
     T: Send + 'static,
     C: Send + Sync + 'static,
 {
