@@ -190,7 +190,7 @@ impl<C: Codec> Pusher<C> {
         }
 
         let mut payload_bytes: Vec<Vec<u8>> = Vec::with_capacity(items.len());
-        let mut keys: Vec<Option<String>> = Vec::with_capacity(items.len());
+        let mut keys: Vec<Option<&str>> = Vec::with_capacity(items.len());
         let mut total_bytes: usize = 0;
         for (i, (payload, key)) in items.iter().enumerate() {
             Self::validate_concurrency_key(key.as_deref())?;
@@ -203,7 +203,7 @@ impl<C: Codec> Pusher<C> {
                 });
             }
             payload_bytes.push(bytes);
-            keys.push(key.clone());
+            keys.push(key.as_deref());
         }
 
         let public_ids: Vec<Uuid> = (0..items.len()).map(|_| Uuid::now_v7()).collect();
