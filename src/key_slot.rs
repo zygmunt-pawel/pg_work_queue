@@ -90,7 +90,8 @@ mod tests {
 
     #[test]
     fn acquire_increments_drop_decrements() {
-        let counter = counter_with(&["k"]);
+        // Start from an empty map so acquire must insert the key (brand-new-key path).
+        let counter: ConcurrencyCounter = Arc::new(Mutex::new(HashMap::new()));
         {
             let _g = KeySlotGuard::acquire(counter.clone(), "k".to_string());
             assert_eq!(count(&counter, "k"), 1);
@@ -112,10 +113,16 @@ mod tests {
 
     #[test]
     fn none_guard_is_noop() {
+        // Acquire a real slot so the counter is non-zero, then prove that
+        // creating and dropping a none() guard leaves it unchanged.
         let counter = counter_with(&["k"]);
+        let real_guard = KeySlotGuard::acquire(counter.clone(), "k".to_string());
+        assert_eq!(count(&counter, "k"), 1);
         {
-            let _g = KeySlotGuard::none();
-        }
+            let _none = KeySlotGuard::none();
+        } // drop of none() must not touch the counter
+        assert_eq!(count(&counter, "k"), 1, "none() guard must not decrement");
+        drop(real_guard);
         assert_eq!(count(&counter, "k"), 0);
     }
 }
