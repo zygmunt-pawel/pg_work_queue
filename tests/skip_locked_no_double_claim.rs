@@ -46,9 +46,10 @@ async fn claim_batch_szanuje_skip_locked_pod_zrownoleglonym_dostepem() {
     tx.commit().await.expect("commit");
 
     let codec = JsonCodec;
+    let headroom = std::collections::HashMap::new();
     let (left, right) = tokio::join!(
-        claim_and_decode::<Payload, _>(&pool, &codec, "q1", 50, Duration::from_secs(10), 3),
-        claim_and_decode::<Payload, _>(&pool, &codec, "q1", 50, Duration::from_secs(10), 3),
+        claim_and_decode::<Payload, _>(&pool, &codec, "q1", 50, Duration::from_secs(10), 3, &headroom),
+        claim_and_decode::<Payload, _>(&pool, &codec, "q1", 50, Duration::from_secs(10), 3, &headroom),
     );
     let left = left.expect("left claim ok");
     let right = right.expect("right claim ok");

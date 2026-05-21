@@ -891,6 +891,7 @@ where
             self.batch_size,
             self.lease_timeout,
             self.max_attempts,
+            &std::collections::HashMap::new(),
         )
         .await?;
 
@@ -1505,6 +1506,9 @@ where
 
         // Wrap the claim await in select! — otherwise pool starvation
         // (sqlx acquire_timeout 30s default) blocks shutdown beyond cancel.
+        // `headroom` is bound here (not inline) so the temporary outlives the
+        // `select!` future. Task 9 replaces this with a real headroom map.
+        let headroom: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let claim_result = tokio::select! {
             r = crate::claim::claim_and_decode::<T, C>(
                 &state.pool,
@@ -1513,6 +1517,7 @@ where
                 want_u32,
                 state.lease_timeout,
                 state.max_attempts,
+                &headroom,
             ) => r,
             () = state.shutdown.cancelled() => break,
         };

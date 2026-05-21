@@ -48,8 +48,16 @@ async fn mark_queries_fenced_out_when_lease_token_drifted() {
 
     let codec = JsonCodec;
     let claimed =
-        claim_and_decode::<Payload, _>(&pool, &codec, "fence_q", 10, Duration::from_secs(30), 3)
-            .await
+        claim_and_decode::<Payload, _>(
+            &pool,
+            &codec,
+            "fence_q",
+            10,
+            Duration::from_secs(30),
+            3,
+            &std::collections::HashMap::new(),
+        )
+        .await
             .expect("claim ok");
     assert_eq!(claimed.len(), 1);
     let job = &claimed[0];

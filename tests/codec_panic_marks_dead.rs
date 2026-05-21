@@ -73,6 +73,7 @@ async fn panic_in_codec_decode_is_isolated_and_marks_only_that_row_dead() {
         10,
         Duration::from_secs(10),
         3,
+        &std::collections::HashMap::new(),
     )
     .await
     .expect("claim_and_decode survived panics");
@@ -120,9 +121,16 @@ async fn panic_in_codec_decode_is_isolated_and_marks_only_that_row_dead() {
         .expect("push ok");
     tx.commit().await.expect("commit");
 
-    let claimed_ok =
-        claim_and_decode::<Payload, _>(&pool, &JsonCodec, "ok_q", 10, Duration::from_secs(10), 3)
-            .await
+    let claimed_ok = claim_and_decode::<Payload, _>(
+        &pool,
+        &JsonCodec,
+        "ok_q",
+        10,
+        Duration::from_secs(10),
+        3,
+        &std::collections::HashMap::new(),
+    )
+    .await
             .expect("ok_q claim");
     assert_eq!(claimed_ok.len(), 1);
     assert_eq!(claimed_ok[0].payload.n, 42);

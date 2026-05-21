@@ -39,8 +39,16 @@ async fn decode_error_marks_row_dead_and_drops_it_from_output() {
 
     let codec = JsonCodec;
     let claimed =
-        claim_and_decode::<SomeStruct, _>(&pool, &codec, "dec_q", 10, Duration::from_secs(10), 3)
-            .await
+        claim_and_decode::<SomeStruct, _>(
+            &pool,
+            &codec,
+            "dec_q",
+            10,
+            Duration::from_secs(10),
+            3,
+            &std::collections::HashMap::new(),
+        )
+        .await
             .expect("claim ok");
     assert!(
         claimed.is_empty(),

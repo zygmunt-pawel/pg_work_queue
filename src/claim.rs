@@ -14,6 +14,7 @@
 //! recovery" — codec decode is CPU-bound and synchronous; spawn would add
 //! scheduling overhead and risk JoinHandle leak under outer abort.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
@@ -51,49 +52,119 @@ pub(crate) struct RawClaimedRow {
 /// fresh `gen_random_uuid()`, and `lease_expires_at = now() + lease_timeout`.
 ///
 /// SQL verbatim from PLAN.md §"`claim_batch` SQL".
+///
+/// `headroom` selects the claim path: empty → the unchanged `claim_batch`
+/// SQL; non-empty → the per-key bounded claim SQL (design spec §5), with the
+/// headroom map bound as `jsonb` (`$5`).
+// `too_many_lines`: the two inline SQL variants make the body long; splitting
+// them out would only obscure the empty/non-empty branch.
+#[allow(clippy::too_many_lines)]
 async fn claim_batch_raw(
     pool: &PgPool,
     queue: &str,
     batch_size: u32,
     lease_timeout: Duration,
     max_attempts: u32,
+    headroom: &HashMap<String, u32>,
 ) -> Result<Vec<RawClaimedRow>, sqlx::Error> {
+    // RETURNING list shared by both SQL variants.
+    const RETURNING: &str = "j.id, j.public_id, j.queue, j.payload, j.attempts, \
+        j.max_attempts, j.first_attempted_at, j.lease_token, j.lease_expires_at, \
+        j.concurrency_key";
+
     // `i32` for binding: PG INTEGER. `u32::min(i32::MAX as u32)` keeps the
     // values DB-shaped without panic in src/.
     let i32_max_u32: u32 = i32::MAX as u32;
     let batch_size_i32: i32 = i32::try_from(batch_size.min(i32_max_u32)).unwrap_or(i32::MAX);
     let max_attempts_i32: i32 = i32::try_from(max_attempts.min(i32_max_u32)).unwrap_or(i32::MAX);
 
-    let rows = sqlx::query(
-        "WITH claimed AS (
-             SELECT id FROM pgwq.jobs
-             WHERE queue = $1
-               AND status IN ('queued', 'awaiting_retry')
-               AND run_at <= now()
-             ORDER BY run_at, id
-             LIMIT $2
-             FOR UPDATE SKIP LOCKED
-         )
-         UPDATE pgwq.jobs j
-         SET status = 'running',
-             attempts = j.attempts + 1,
-             max_attempts = $4,
-             last_attempted_at = now(),
-             first_attempted_at = COALESCE(j.first_attempted_at, now()),
-             lease_token = gen_random_uuid(),
-             lease_expires_at = now() + $3::interval,
-             last_error = NULL
-         FROM claimed
-         WHERE j.id = claimed.id
-         RETURNING j.id, j.public_id, j.queue, j.concurrency_key, j.payload, j.attempts, j.max_attempts,
-                   j.first_attempted_at, j.lease_token, j.lease_expires_at",
-    )
-    .bind(queue)
-    .bind(batch_size_i32)
-    .bind(lease_timeout)
-    .bind(max_attempts_i32)
-    .fetch_all(pool)
-    .await?;
+    let rows = if headroom.is_empty() {
+        sqlx::query(&format!(
+            "WITH claimed AS (
+                 SELECT id FROM pgwq.jobs
+                 WHERE queue = $1
+                   AND status IN ('queued', 'awaiting_retry')
+                   AND run_at <= now()
+                 ORDER BY run_at, id
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE pgwq.jobs j
+             SET status = 'running', attempts = j.attempts + 1, max_attempts = $4,
+                 last_attempted_at = now(),
+                 first_attempted_at = COALESCE(j.first_attempted_at, now()),
+                 lease_token = gen_random_uuid(),
+                 lease_expires_at = now() + $3::interval, last_error = NULL
+             FROM claimed
+             WHERE j.id = claimed.id
+             RETURNING {RETURNING}"
+        ))
+        .bind(queue)
+        .bind(batch_size_i32)
+        .bind(lease_timeout)
+        .bind(max_attempts_i32)
+        .fetch_all(pool)
+        .await?
+    } else {
+        let headroom_json = serde_json::to_string(headroom).unwrap_or_else(|_| "{}".to_string());
+        sqlx::query(&format!(
+            "WITH
+             hr AS (
+                 SELECT key AS concurrency_key, value::int AS h
+                 FROM jsonb_each_text($5::jsonb)
+             ),
+             eligible_keyed AS (
+                 SELECT e.id
+                 FROM hr
+                 CROSS JOIN LATERAL (
+                     SELECT j.id FROM pgwq.jobs j
+                     WHERE j.queue = $1
+                       AND j.status IN ('queued', 'awaiting_retry')
+                       AND j.concurrency_key = hr.concurrency_key
+                       AND j.run_at <= now()
+                     ORDER BY j.run_at, j.id
+                     LIMIT LEAST(GREATEST(hr.h, 0), $2)
+                 ) e
+             ),
+             eligible_unlimited AS (
+                 SELECT j.id FROM pgwq.jobs j
+                 LEFT JOIN hr ON hr.concurrency_key = j.concurrency_key
+                 WHERE j.queue = $1
+                   AND j.status IN ('queued', 'awaiting_retry')
+                   AND j.run_at <= now()
+                   AND hr.concurrency_key IS NULL
+                 ORDER BY j.run_at, j.id
+                 LIMIT $2
+             ),
+             locked AS (
+                 SELECT j.id FROM pgwq.jobs j
+                 WHERE j.id IN (SELECT id FROM eligible_keyed
+                                UNION ALL
+                                SELECT id FROM eligible_unlimited)
+                   AND j.status IN ('queued', 'awaiting_retry')
+                   AND j.run_at <= now()
+                 ORDER BY j.run_at, j.id
+                 LIMIT $2
+                 FOR UPDATE SKIP LOCKED
+             )
+             UPDATE pgwq.jobs j
+             SET status = 'running', attempts = j.attempts + 1, max_attempts = $4,
+                 last_attempted_at = now(),
+                 first_attempted_at = COALESCE(j.first_attempted_at, now()),
+                 lease_token = gen_random_uuid(),
+                 lease_expires_at = now() + $3::interval, last_error = NULL
+             FROM locked
+             WHERE j.id = locked.id
+             RETURNING {RETURNING}"
+        ))
+        .bind(queue)
+        .bind(batch_size_i32)
+        .bind(lease_timeout)
+        .bind(max_attempts_i32)
+        .bind(headroom_json)
+        .fetch_all(pool)
+        .await?
+    };
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
@@ -140,6 +211,10 @@ fn extract_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// fails. `mark_dead` failures on individual rows are logged at `warn`
 /// and swallowed — the reaper recovers those rows via lease expiration
 /// (per PLAN.md §"Error semantics", codec-decode-failure path).
+// `implicit_hasher`: the only caller is the Worker poll loop, which builds the
+// headroom map with the default hasher; a `BuildHasher` type parameter would
+// leak into the crate-internal call sites for no benefit.
+#[allow(clippy::implicit_hasher)]
 #[doc(hidden)]
 pub async fn claim_and_decode<T, C>(
     pool: &PgPool,
@@ -148,12 +223,14 @@ pub async fn claim_and_decode<T, C>(
     batch_size: u32,
     lease_timeout: Duration,
     max_attempts: u32,
+    headroom: &HashMap<String, u32>,
 ) -> Result<Vec<Job<T>>, sqlx::Error>
 where
     T: serde::de::DeserializeOwned,
     C: Codec,
 {
-    let raws = claim_batch_raw(pool, queue, batch_size, lease_timeout, max_attempts).await?;
+    let raws =
+        claim_batch_raw(pool, queue, batch_size, lease_timeout, max_attempts, headroom).await?;
     let mut out: Vec<Job<T>> = Vec::with_capacity(raws.len());
 
     for raw in raws {

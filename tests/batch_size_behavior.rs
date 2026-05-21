@@ -41,24 +41,56 @@ async fn claim_batch_respektuje_limit() {
     let codec = JsonCodec;
     let lease = Duration::from_secs(30);
 
-    let c1 = claim_and_decode::<Payload, _>(&pool, &codec, "bs_q", 10, lease, 3)
-        .await
-        .expect("c1");
+    let c1 = claim_and_decode::<Payload, _>(
+        &pool,
+        &codec,
+        "bs_q",
+        10,
+        lease,
+        3,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .expect("c1");
     assert_eq!(c1.len(), 10, "first claim must return exactly batch_size");
 
-    let c2 = claim_and_decode::<Payload, _>(&pool, &codec, "bs_q", 50, lease, 3)
-        .await
-        .expect("c2");
+    let c2 = claim_and_decode::<Payload, _>(
+        &pool,
+        &codec,
+        "bs_q",
+        50,
+        lease,
+        3,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .expect("c2");
     assert_eq!(c2.len(), 50, "second claim must return exactly batch_size");
 
-    let c3 = claim_and_decode::<Payload, _>(&pool, &codec, "bs_q", 50, lease, 3)
-        .await
-        .expect("c3");
+    let c3 = claim_and_decode::<Payload, _>(
+        &pool,
+        &codec,
+        "bs_q",
+        50,
+        lease,
+        3,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .expect("c3");
     assert_eq!(c3.len(), 40, "third claim takes whatever remains (40)");
 
-    let c4 = claim_and_decode::<Payload, _>(&pool, &codec, "bs_q", 50, lease, 3)
-        .await
-        .expect("c4");
+    let c4 = claim_and_decode::<Payload, _>(
+        &pool,
+        &codec,
+        "bs_q",
+        50,
+        lease,
+        3,
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .expect("c4");
     assert!(c4.is_empty(), "queue drained; fourth claim must be empty");
 
     let mut ids: HashSet<i64> = HashSet::new();
