@@ -21,6 +21,9 @@ pub struct Job<T> {
     pub public_id: Uuid,
     /// Source queue name (matches `Pusher`'s queue).
     pub queue: String,
+    /// Optional per-key concurrency bucket, stamped at enqueue. `None` =
+    /// unlimited. Immutable for the job's lifetime.
+    pub concurrency_key: Option<String>,
     /// Decoded payload. `claim_and_decode` produced this from `payload BYTEA`
     /// via the configured `Codec`.
     pub payload: T,

@@ -129,3 +129,28 @@ async fn push_batch_carries_per_item_keys_in_order() {
         assert_eq!(key, want);
     }
 }
+
+// Un-commented in Task 6 (needs Task 5's claim_and_decode signature).
+//
+// #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// #[ignore = "needs Task 5 claim_and_decode signature"]
+// async fn claimed_job_exposes_concurrency_key() {
+//     let (pool, _c) = pg18_pool().await;
+//     let mut tx = pool.begin().await.unwrap();
+//     Pusher::new("q").push(&mut tx, &T { n: 1 }, Some("k")).await.unwrap();
+//     tx.commit().await.unwrap();
+//
+//     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
+//         &pool,
+//         &pg_work_queue::JsonCodec,
+//         "q",
+//         10,
+//         std::time::Duration::from_secs(30),
+//         3,
+//         &std::collections::HashMap::new(),
+//     )
+//     .await
+//     .unwrap();
+//     assert_eq!(jobs.len(), 1);
+//     assert_eq!(jobs[0].concurrency_key.as_deref(), Some("k"));
+// }

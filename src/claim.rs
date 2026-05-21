@@ -35,6 +35,7 @@ pub(crate) struct RawClaimedRow {
     pub(crate) id: i64,
     pub(crate) public_id: Uuid,
     pub(crate) queue: String,
+    pub(crate) concurrency_key: Option<String>,
     pub(crate) payload: Vec<u8>,
     pub(crate) attempts: u32,
     pub(crate) max_attempts: u32,
@@ -84,7 +85,7 @@ async fn claim_batch_raw(
              last_error = NULL
          FROM claimed
          WHERE j.id = claimed.id
-         RETURNING j.id, j.public_id, j.queue, j.payload, j.attempts, j.max_attempts,
+         RETURNING j.id, j.public_id, j.queue, j.concurrency_key, j.payload, j.attempts, j.max_attempts,
                    j.first_attempted_at, j.lease_token, j.lease_expires_at",
     )
     .bind(queue)
@@ -102,6 +103,7 @@ async fn claim_batch_raw(
             id: r.try_get("id")?,
             public_id: r.try_get("public_id")?,
             queue: r.try_get("queue")?,
+            concurrency_key: r.try_get("concurrency_key")?,
             payload: r.try_get("payload")?,
             // attempts is CHECK >= 0 → non-negative i32 fits in u32 unconditionally.
             attempts: u32::try_from(attempts_i32).unwrap_or(0),
@@ -166,6 +168,7 @@ where
                     id: raw.id,
                     public_id: raw.public_id,
                     queue: raw.queue,
+                    concurrency_key: raw.concurrency_key,
                     payload,
                     attempts: raw.attempts,
                     max_attempts: raw.max_attempts,
