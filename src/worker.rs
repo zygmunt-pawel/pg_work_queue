@@ -1538,6 +1538,11 @@ where
     // as `ShutdownError::Fatal`. Reset on any `Ok(_)` from `claim_and_decode`.
     let mut consecutive_claim_errors: u32 = 0;
 
+    // Edge-triggered saturation logging: emit only when the set of
+    // headroom-0 keys changes between ticks.
+    let mut prev_saturated: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {},
@@ -1604,6 +1609,24 @@ where
                         .collect()
                 },
             );
+        let saturated: std::collections::BTreeSet<String> = headroom
+            .iter()
+            .filter(|&(_, &h)| h == 0)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if saturated != prev_saturated {
+            if !saturated.is_empty() {
+                tracing::event!(
+                    target: "pgwq.claim",
+                    tracing::Level::DEBUG,
+                    worker.id = %state.worker_id,
+                    queue = %state.queue,
+                    saturated_keys = ?saturated,
+                    "per-key concurrency saturated",
+                );
+            }
+            prev_saturated = saturated;
+        }
         let claim_result = tokio::select! {
             r = crate::claim::claim_and_decode::<T, C>(
                 &state.pool,
