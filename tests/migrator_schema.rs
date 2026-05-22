@@ -10,13 +10,15 @@
 //!
 //! Sprawdza wszystkie elementy schema z PLAN.md §"Schema (DB layout)":
 //! - schema `pgwq` istnieje
-//! - tabela `pgwq.jobs` ma expected columns (incl. `max_attempts`)
+//! - tabela `pgwq.jobs` ma expected columns (incl. `max_attempts`, `concurrency_key`)
 //! - enum `pgwq.job_status` ma 5 wariantów
 //! - INSERT płatne payload > 1 MiB → SQLSTATE 23xxx (CHECK violation)
 //! - INSERT z queue='' → CHECK violation
 //! - INSERT z queue dłuższym niż 64 znaki → CHECK violation
 //! - reloptions zawierają fillfactor=90 + obie autovacuum scale factors
-//! - 3 partial indexes istnieją (jobs_claim_idx, jobs_reap_idx, jobs_terminal_idx)
+//! - 4 partial indexes istnieją (jobs_claim_idx, jobs_reap_idx, jobs_terminal_idx, jobs_claim_conc_idx)
+//! - CHECK constraint `jobs_concurrency_key_len` istnieje
+//! - trigger `assert_concurrency_key_immutable` istnieje
 
 mod common;
 
@@ -65,6 +67,7 @@ async fn pgwq_schema_table_enum_columns_present() {
         "lease_expires_at",
         "last_error",
         "run_at",
+        "concurrency_key",
     ] {
         assert!(
             cols.iter().any(|c| c == required),
@@ -168,7 +171,7 @@ async fn reloptions_contain_fillfactor_and_autovacuum_scale() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn three_partial_indexes_present() {
+async fn partial_indexes_present() {
     let (pool, _c) = common::pg18_pool().await;
     let idxs: Vec<String> = sqlx::query_scalar(
         "SELECT indexname FROM pg_indexes
@@ -177,14 +180,24 @@ async fn three_partial_indexes_present() {
     .fetch_all(&pool)
     .await
     .expect("indexes");
-    for expected in ["jobs_claim_idx", "jobs_reap_idx", "jobs_terminal_idx"] {
+    for expected in [
+        "jobs_claim_idx",
+        "jobs_reap_idx",
+        "jobs_terminal_idx",
+        "jobs_claim_conc_idx",
+    ] {
         assert!(
             idxs.iter().any(|i| i == expected),
             "missing index {expected}; got {idxs:?}"
         );
     }
-    // Confirm partiality — each has WHERE in pg_indexes.indexdef.
-    for expected in ["jobs_claim_idx", "jobs_reap_idx", "jobs_terminal_idx"] {
+    // Potwierdź partialność — każdy ma WHERE w pg_indexes.indexdef.
+    for expected in [
+        "jobs_claim_idx",
+        "jobs_reap_idx",
+        "jobs_terminal_idx",
+        "jobs_claim_conc_idx",
+    ] {
         let def: String = sqlx::query_scalar(
             "SELECT indexdef FROM pg_indexes
              WHERE schemaname='pgwq' AND tablename='jobs' AND indexname=$1",
@@ -198,6 +211,36 @@ async fn three_partial_indexes_present() {
             "{expected} not partial: {def}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrency_key_len_check_constraint_present() {
+    let (pool, _c) = common::pg18_pool().await;
+    let row: (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'jobs_concurrency_key_len')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query constraint");
+    assert!(
+        row.0,
+        "CHECK constraint jobs_concurrency_key_len must exist"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrency_key_immutable_trigger_present() {
+    let (pool, _c) = common::pg18_pool().await;
+    let row: (bool,) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname = 'assert_concurrency_key_immutable')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query trigger");
+    assert!(
+        row.0,
+        "trigger assert_concurrency_key_immutable must exist"
+    );
 }
 
 fn assert_sqlstate_23(err: &sqlx::Error) {
