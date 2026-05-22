@@ -24,7 +24,10 @@ struct T {
 async fn direct_update_of_concurrency_key_is_rejected() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let id = Pusher::new("q").push(&mut tx, &T { n: 1 }, Some("k")).await.unwrap();
+    let id = Pusher::new("q")
+        .push(&mut tx, &T { n: 1 }, Some("k"))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let err = sqlx::query("UPDATE pgwq.jobs SET concurrency_key = 'other' WHERE public_id = $1")
@@ -33,14 +36,20 @@ async fn direct_update_of_concurrency_key_is_rejected() {
         .await
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("immutable"), "expected immutability error, got: {msg}");
+    assert!(
+        msg.contains("immutable"),
+        "expected immutability error, got: {msg}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setting_concurrency_key_from_null_is_rejected() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let id = Pusher::new("q").push(&mut tx, &T { n: 1 }, None).await.unwrap();
+    let id = Pusher::new("q")
+        .push(&mut tx, &T { n: 1 }, None)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let err = sqlx::query("UPDATE pgwq.jobs SET concurrency_key = 'x' WHERE public_id = $1")
@@ -84,13 +93,12 @@ async fn claim_and_mark_done_preserve_concurrency_key() {
     // Wait for the job to reach 'done'.
     let start = std::time::Instant::now();
     loop {
-        let s: String = sqlx::query_scalar(
-            "SELECT status::text FROM pgwq.jobs WHERE public_id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let s: String =
+            sqlx::query_scalar("SELECT status::text FROM pgwq.jobs WHERE public_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         if s == "done" {
             break;
         }
@@ -105,13 +113,12 @@ async fn claim_and_mark_done_preserve_concurrency_key() {
     let _ = handle.join().await;
 
     // Verify the key is still intact after claim + mark_done UPDATEs.
-    let stored_key: Option<String> = sqlx::query_scalar(
-        "SELECT concurrency_key FROM pgwq.jobs WHERE public_id = $1",
-    )
-    .bind(id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let stored_key: Option<String> =
+        sqlx::query_scalar("SELECT concurrency_key FROM pgwq.jobs WHERE public_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(
         stored_key.as_deref(),

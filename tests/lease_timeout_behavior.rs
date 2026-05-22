@@ -35,8 +35,12 @@ async fn lease_timeout_knob_writes_per_row_lease_expires_at() {
     let pa = Pusher::new("ls_a");
     let pb = Pusher::new("ls_b");
     let mut tx = pool.begin().await.expect("tx");
-    pa.push(&mut tx, &Payload { seq: 1 }, None).await.expect("push a");
-    pb.push(&mut tx, &Payload { seq: 2 }, None).await.expect("push b");
+    pa.push(&mut tx, &Payload { seq: 1 }, None)
+        .await
+        .expect("push a");
+    pb.push(&mut tx, &Payload { seq: 2 }, None)
+        .await
+        .expect("push b");
     tx.commit().await.expect("commit");
 
     // Both handlers block forever on a Notify — we never wake them, we just

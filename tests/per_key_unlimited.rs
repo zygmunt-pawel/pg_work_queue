@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
-struct T { n: u32 }
+struct T {
+    n: u32,
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn null_key_jobs_all_complete() {

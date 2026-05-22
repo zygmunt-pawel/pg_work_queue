@@ -161,22 +161,22 @@ async fn claim_batch_raw(
 
     let rows = if headroom.is_empty() {
         sqlx::query(SQL_PLAIN)
-        .bind(queue)
-        .bind(batch_size_i32)
-        .bind(lease_timeout)
-        .bind(max_attempts_i32)
-        .fetch_all(pool)
-        .await?
+            .bind(queue)
+            .bind(batch_size_i32)
+            .bind(lease_timeout)
+            .bind(max_attempts_i32)
+            .fetch_all(pool)
+            .await?
     } else {
         let headroom_json = serde_json::to_string(headroom).unwrap_or_else(|_| "{}".to_string());
         sqlx::query(SQL_KEYED)
-        .bind(queue)
-        .bind(batch_size_i32)
-        .bind(lease_timeout)
-        .bind(max_attempts_i32)
-        .bind(headroom_json)
-        .fetch_all(pool)
-        .await?
+            .bind(queue)
+            .bind(batch_size_i32)
+            .bind(lease_timeout)
+            .bind(max_attempts_i32)
+            .bind(headroom_json)
+            .fetch_all(pool)
+            .await?
     };
 
     let mut out = Vec::with_capacity(rows.len());
@@ -245,8 +245,15 @@ where
     T: serde::de::DeserializeOwned,
     C: Codec,
 {
-    let raws =
-        claim_batch_raw(pool, queue, batch_size, lease_timeout, max_attempts, headroom).await?;
+    let raws = claim_batch_raw(
+        pool,
+        queue,
+        batch_size,
+        lease_timeout,
+        max_attempts,
+        headroom,
+    )
+    .await?;
     let mut out: Vec<Job<T>> = Vec::with_capacity(raws.len());
 
     for raw in raws {

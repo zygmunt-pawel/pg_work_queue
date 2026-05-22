@@ -27,7 +27,8 @@ struct Payload {
 
 async fn push_n(pool: &sqlx::PgPool, queue: &str, n: u32) {
     let pusher = Pusher::new(queue);
-    let payloads: Vec<(Payload, Option<String>)> = (0..n).map(|i| (Payload { seq: i }, None)).collect();
+    let payloads: Vec<(Payload, Option<String>)> =
+        (0..n).map(|i| (Payload { seq: i }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher.push_batch(&mut tx, &payloads).await.expect("batch");
     tx.commit().await.expect("commit");

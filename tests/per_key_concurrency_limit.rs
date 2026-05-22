@@ -16,13 +16,19 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
-struct T { n: u32 }
+struct T {
+    n: u32,
+}
 
 async fn push_n_keyed(pool: &sqlx::PgPool, queue: &str, key: &str, n: u32) {
     let mut tx = pool.begin().await.unwrap();
-    let items: Vec<(T, Option<String>)> =
-        (0..n).map(|i| (T { n: i }, Some(key.to_string()))).collect();
-    Pusher::new(queue).push_batch(&mut tx, &items).await.unwrap();
+    let items: Vec<(T, Option<String>)> = (0..n)
+        .map(|i| (T { n: i }, Some(key.to_string())))
+        .collect();
+    Pusher::new(queue)
+        .push_batch(&mut tx, &items)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 }
 
@@ -33,7 +39,13 @@ async fn keyed_claim_respects_headroom_limit_2() {
 
     let headroom: HashMap<String, u32> = [("k".to_string(), 2u32)].into();
     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
-        &pool, &JsonCodec, "q", 32, Duration::from_secs(30), 3, &headroom,
+        &pool,
+        &JsonCodec,
+        "q",
+        32,
+        Duration::from_secs(30),
+        3,
+        &headroom,
     )
     .await
     .unwrap();
@@ -49,7 +61,13 @@ async fn keyed_claim_respects_headroom_limit_1() {
 
     let headroom: HashMap<String, u32> = [("k".to_string(), 1u32)].into();
     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
-        &pool, &JsonCodec, "q", 32, Duration::from_secs(30), 3, &headroom,
+        &pool,
+        &JsonCodec,
+        "q",
+        32,
+        Duration::from_secs(30),
+        3,
+        &headroom,
     )
     .await
     .unwrap();
@@ -63,7 +81,13 @@ async fn keyed_claim_saturated_key_claims_zero() {
 
     let headroom: HashMap<String, u32> = [("k".to_string(), 0u32)].into();
     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
-        &pool, &JsonCodec, "q", 32, Duration::from_secs(30), 3, &headroom,
+        &pool,
+        &JsonCodec,
+        "q",
+        32,
+        Duration::from_secs(30),
+        3,
+        &headroom,
     )
     .await
     .unwrap();
@@ -77,7 +101,13 @@ async fn keyed_claim_unconfigured_key_is_unlimited() {
 
     let headroom: HashMap<String, u32> = [("k".to_string(), 1u32)].into();
     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
-        &pool, &JsonCodec, "q", 32, Duration::from_secs(30), 3, &headroom,
+        &pool,
+        &JsonCodec,
+        "q",
+        32,
+        Duration::from_secs(30),
+        3,
+        &headroom,
     )
     .await
     .unwrap();
@@ -88,14 +118,19 @@ async fn keyed_claim_unconfigured_key_is_unlimited() {
 async fn keyed_claim_null_key_is_unlimited() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let items: Vec<(T, Option<String>)> =
-        (0..10).map(|i| (T { n: i }, None)).collect();
+    let items: Vec<(T, Option<String>)> = (0..10).map(|i| (T { n: i }, None)).collect();
     Pusher::new("q").push_batch(&mut tx, &items).await.unwrap();
     tx.commit().await.unwrap();
 
     let headroom: HashMap<String, u32> = [("k".to_string(), 1u32)].into();
     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
-        &pool, &JsonCodec, "q", 32, Duration::from_secs(30), 3, &headroom,
+        &pool,
+        &JsonCodec,
+        "q",
+        32,
+        Duration::from_secs(30),
+        3,
+        &headroom,
     )
     .await
     .unwrap();

@@ -39,7 +39,8 @@ async fn claim_size_bounded_by_permits_so_no_wait_window() {
         .expect("create starts table");
 
     let pusher = Pusher::new("permits_q");
-    let payloads: Vec<(Payload, Option<String>)> = (0..20u32).map(|i| (Payload { seq: i }, None)).collect();
+    let payloads: Vec<(Payload, Option<String>)> =
+        (0..20u32).map(|i| (Payload { seq: i }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

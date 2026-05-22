@@ -44,10 +44,7 @@ async fn push_with_none_key_is_null() {
     let (pool, _c) = pg18_pool().await;
     let pusher = Pusher::new("q");
     let mut tx = pool.begin().await.expect("tx");
-    let id = pusher
-        .push(&mut tx, &T { n: 1 }, None)
-        .await
-        .expect("push");
+    let id = pusher.push(&mut tx, &T { n: 1 }, None).await.expect("push");
     tx.commit().await.expect("commit");
 
     let key: Option<String> =
@@ -118,14 +115,17 @@ async fn push_batch_carries_per_item_keys_in_order() {
     assert_eq!(ids.len(), 3);
 
     for (id, expected) in ids.iter().zip(["a", "", "b"]) {
-        let key: Option<String> = sqlx::query_scalar(
-            "SELECT concurrency_key FROM pgwq.jobs WHERE public_id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let want = if expected.is_empty() { None } else { Some(expected.to_string()) };
+        let key: Option<String> =
+            sqlx::query_scalar("SELECT concurrency_key FROM pgwq.jobs WHERE public_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let want = if expected.is_empty() {
+            None
+        } else {
+            Some(expected.to_string())
+        };
         assert_eq!(key, want);
     }
 }
@@ -134,7 +134,10 @@ async fn push_batch_carries_per_item_keys_in_order() {
 async fn claimed_job_exposes_concurrency_key() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    Pusher::new("q").push(&mut tx, &T { n: 1 }, Some("k")).await.unwrap();
+    Pusher::new("q")
+        .push(&mut tx, &T { n: 1 }, Some("k"))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(

@@ -131,7 +131,7 @@ async fn panic_in_codec_decode_is_isolated_and_marks_only_that_row_dead() {
         &std::collections::HashMap::new(),
     )
     .await
-            .expect("ok_q claim");
+    .expect("ok_q claim");
     assert_eq!(claimed_ok.len(), 1);
     assert_eq!(claimed_ok[0].payload.n, 42);
 }

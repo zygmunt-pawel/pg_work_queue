@@ -468,10 +468,7 @@ impl<T, C, H> WorkerBuilder<T, C, H> {
     /// **Single-instance only** — the limit is enforced via an in-process
     /// counter. See the README "Per-key concurrency" section.
     #[must_use]
-    pub fn concurrency_limits(
-        mut self,
-        limits: impl IntoIterator<Item = (String, u32)>,
-    ) -> Self {
+    pub fn concurrency_limits(mut self, limits: impl IntoIterator<Item = (String, u32)>) -> Self {
         for (k, v) in limits {
             if let Some(prev) = self.concurrency_limits.insert(k.clone(), v) {
                 tracing::warn!(
@@ -1055,8 +1052,11 @@ where
                 // crashed prior process are dead ghosts that consume nothing;
                 // the reaper reclaims them. Every configured key is
                 // initialized to 0 so headroom/acquire never hit a missing key.
-                let initial: HashMap<String, u32> =
-                    self.concurrency_limits.keys().map(|k| (k.clone(), 0)).collect();
+                let initial: HashMap<String, u32> = self
+                    .concurrency_limits
+                    .keys()
+                    .map(|k| (k.clone(), 0))
+                    .collect();
                 Arc::new(std::sync::Mutex::new(initial))
             },
             concurrency_limits: self.concurrency_limits,
@@ -1543,8 +1543,7 @@ where
 
     // Edge-triggered saturation logging: emit only when the set of
     // headroom-0 keys changes between ticks.
-    let mut prev_saturated: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut prev_saturated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     loop {
         tokio::select! {

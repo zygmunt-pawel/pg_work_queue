@@ -142,7 +142,10 @@ async fn duplicate_concurrency_key_last_wins_and_warns() {
             .build()
     });
 
-    assert!(built.is_ok(), "duplicate key is last-wins, build must succeed");
+    assert!(
+        built.is_ok(),
+        "duplicate key is last-wins, build must succeed"
+    );
 
     let captured = messages.lock().unwrap().clone();
     assert!(

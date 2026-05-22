@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
-struct T { key: String }
+struct T {
+    key: String,
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn limit_enforced_and_other_keys_progress() {
@@ -66,8 +68,15 @@ async fn limit_enforced_and_other_keys_progress() {
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert_eq!(fast_done.load(Ordering::SeqCst), 3, "fast key not head-of-line blocked");
+    assert_eq!(
+        fast_done.load(Ordering::SeqCst),
+        3,
+        "fast key not head-of-line blocked"
+    );
 
     let _ = handle.shutdown(Duration::from_secs(10)).await;
-    assert!(slow_peak.load(Ordering::SeqCst) <= 2, "slow key exceeded limit 2");
+    assert!(
+        slow_peak.load(Ordering::SeqCst) <= 2,
+        "slow key exceeded limit 2"
+    );
 }

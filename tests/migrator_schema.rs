@@ -237,10 +237,7 @@ async fn concurrency_key_immutable_trigger_present() {
     .fetch_one(&pool)
     .await
     .expect("query trigger");
-    assert!(
-        row.0,
-        "trigger assert_concurrency_key_immutable must exist"
-    );
+    assert!(row.0, "trigger assert_concurrency_key_immutable must exist");
 }
 
 fn assert_sqlstate_23(err: &sqlx::Error) {

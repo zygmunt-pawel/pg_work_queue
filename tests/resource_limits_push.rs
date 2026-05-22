@@ -41,7 +41,10 @@ async fn single_push_oversize_payload_returns_payload_too_large_index_zero() {
     };
     let pusher = Pusher::new("q");
     let mut tx = pool.begin().await.expect("tx");
-    let err = pusher.push(&mut tx, &payload, None).await.expect_err("must fail");
+    let err = pusher
+        .push(&mut tx, &payload, None)
+        .await
+        .expect_err("must fail");
     match err {
         PushError::PayloadTooLarge { index, size, max } => {
             assert_eq!(index, 0);
@@ -91,13 +94,21 @@ async fn batch_item_index_three_oversize_reports_index_three() {
     let pusher = Pusher::new("q");
     // Items 0..3 small, item 3 oversize.
     let mut items: Vec<(Bag, Option<String>)> = (0..3)
-        .map(|_| (Bag {
-            blob: vec![0u8; 100],
-        }, None))
+        .map(|_| {
+            (
+                Bag {
+                    blob: vec![0u8; 100],
+                },
+                None,
+            )
+        })
         .collect();
-    items.push((Bag {
-        blob: vec![0u8; MAX_PAYLOAD_BYTES + 1024],
-    }, None));
+    items.push((
+        Bag {
+            blob: vec![0u8; MAX_PAYLOAD_BYTES + 1024],
+        },
+        None,
+    ));
     let mut tx = pool.begin().await.expect("tx");
     let err = pusher
         .push_batch(&mut tx, &items)
@@ -151,7 +162,10 @@ async fn pusher_new_empty_queue_is_infallible_push_returns_queue_name_invalid() 
     // Per PLAN.md / API sketch: Pusher::new infallible; queue validation on push.
     let pusher = Pusher::new(""); // does NOT panic
     let mut tx = pool.begin().await.expect("tx");
-    let err = pusher.push(&mut tx, &42u32, None).await.expect_err("must fail");
+    let err = pusher
+        .push(&mut tx, &42u32, None)
+        .await
+        .expect_err("must fail");
     match err {
         PushError::QueueNameInvalid(name) => assert_eq!(name, ""),
         e => panic!("expected QueueNameInvalid, got {e:?}"),
@@ -164,7 +178,10 @@ async fn queue_name_over_max_len_returns_queue_name_invalid_on_push() {
     let too_long = "x".repeat(MAX_QUEUE_LEN + 1);
     let pusher = Pusher::new(&too_long);
     let mut tx = pool.begin().await.expect("tx");
-    let err = pusher.push(&mut tx, &42u32, None).await.expect_err("must fail");
+    let err = pusher
+        .push(&mut tx, &42u32, None)
+        .await
+        .expect_err("must fail");
     match err {
         PushError::QueueNameInvalid(name) => assert_eq!(name.len(), MAX_QUEUE_LEN + 1),
         e => panic!("expected QueueNameInvalid, got {e:?}"),

@@ -36,7 +36,8 @@ struct Payload {
 async fn claim_batch_szanuje_skip_locked_pod_zrownoleglonym_dostepem() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("q1");
-    let payloads: Vec<(Payload, Option<String>)> = (0..100u32).map(|seq| (Payload { seq }, None)).collect();
+    let payloads: Vec<(Payload, Option<String>)> =
+        (0..100u32).map(|seq| (Payload { seq }, None)).collect();
 
     let mut tx = pool.begin().await.expect("tx");
     pusher
@@ -48,8 +49,24 @@ async fn claim_batch_szanuje_skip_locked_pod_zrownoleglonym_dostepem() {
     let codec = JsonCodec;
     let headroom = std::collections::HashMap::new();
     let (left, right) = tokio::join!(
-        claim_and_decode::<Payload, _>(&pool, &codec, "q1", 50, Duration::from_secs(10), 3, &headroom),
-        claim_and_decode::<Payload, _>(&pool, &codec, "q1", 50, Duration::from_secs(10), 3, &headroom),
+        claim_and_decode::<Payload, _>(
+            &pool,
+            &codec,
+            "q1",
+            50,
+            Duration::from_secs(10),
+            3,
+            &headroom
+        ),
+        claim_and_decode::<Payload, _>(
+            &pool,
+            &codec,
+            "q1",
+            50,
+            Duration::from_secs(10),
+            3,
+            &headroom
+        ),
     );
     let left = left.expect("left claim ok");
     let right = right.expect("right claim ok");

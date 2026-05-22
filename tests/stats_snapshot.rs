@@ -32,7 +32,8 @@ async fn stats_reflect_terminal_state_distribution() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("stats_q");
     // 5 jobów: seq 0..=2 → Ok; seq 3..=4 → Abort (mark_dead direct).
-    let payloads: Vec<(Payload, Option<String>)> = (0..5u32).map(|i| (Payload { seq: i }, None)).collect();
+    let payloads: Vec<(Payload, Option<String>)> =
+        (0..5u32).map(|i| (Payload { seq: i }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher
         .push_batch(&mut tx, &payloads)

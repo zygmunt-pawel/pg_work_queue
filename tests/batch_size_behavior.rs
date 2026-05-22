@@ -33,7 +33,8 @@ struct Payload {
 async fn claim_batch_respektuje_limit() {
     let (pool, _c) = common::pg18_pool().await;
     let pusher = Pusher::new("bs_q");
-    let payloads: Vec<(Payload, Option<String>)> = (0..100u32).map(|seq| (Payload { seq }, None)).collect();
+    let payloads: Vec<(Payload, Option<String>)> =
+        (0..100u32).map(|seq| (Payload { seq }, None)).collect();
     let mut tx = pool.begin().await.expect("tx");
     pusher.push_batch(&mut tx, &payloads).await.expect("push");
     tx.commit().await.expect("commit");

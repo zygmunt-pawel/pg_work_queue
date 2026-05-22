@@ -16,14 +16,17 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 #[derive(Serialize, Deserialize)]
-struct T { n: u32 }
+struct T {
+    n: u32,
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn counter_restored_after_all_jobs_complete() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let items: Vec<(T, Option<String>)> =
-        (0..5).map(|i| (T { n: i }, Some("k".to_string()))).collect();
+    let items: Vec<(T, Option<String>)> = (0..5)
+        .map(|i| (T { n: i }, Some("k".to_string())))
+        .collect();
     Pusher::new("q").push_batch(&mut tx, &items).await.unwrap();
     tx.commit().await.unwrap();
 
@@ -41,12 +44,10 @@ async fn counter_restored_after_all_jobs_complete() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     let _ = handle.shutdown(Duration::from_secs(10)).await;
 
-    let done: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pgwq.jobs WHERE status = 'done'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let done: i64 = sqlx::query_scalar("SELECT count(*) FROM pgwq.jobs WHERE status = 'done'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(done, 5, "all keyed jobs completed -> counter did not wedge");
 }
 
@@ -63,8 +64,9 @@ async fn counter_restored_after_all_jobs_complete() {
 async fn counter_decrements_on_shutdown_abort() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let items: Vec<(T, Option<String>)> =
-        (0..2).map(|i| (T { n: i }, Some("k".to_string()))).collect();
+    let items: Vec<(T, Option<String>)> = (0..2)
+        .map(|i| (T { n: i }, Some("k".to_string())))
+        .collect();
     Pusher::new("q").push_batch(&mut tx, &items).await.unwrap();
     tx.commit().await.unwrap();
 
@@ -104,8 +106,9 @@ async fn counter_decrements_on_shutdown_abort() {
 async fn counter_decrements_on_err_dead_exit() {
     let (pool, _c) = pg18_pool().await;
     let mut tx = pool.begin().await.unwrap();
-    let items: Vec<(T, Option<String>)> =
-        (0..5).map(|i| (T { n: i }, Some("k".to_string()))).collect();
+    let items: Vec<(T, Option<String>)> = (0..5)
+        .map(|i| (T { n: i }, Some("k".to_string())))
+        .collect();
     Pusher::new("q").push_batch(&mut tx, &items).await.unwrap();
     tx.commit().await.unwrap();
 
@@ -114,9 +117,7 @@ async fn counter_decrements_on_err_dead_exit() {
         .queue("q")
         .max_attempts(1)
         .concurrency_limits([("k".to_string(), 2u32)])
-        .handler(|_t: T, _c: JobContext| async {
-            Err::<(), JobError>(JobError::retry("x"))
-        })
+        .handler(|_t: T, _c: JobContext| async { Err::<(), JobError>(JobError::retry("x")) })
         .build()
         .unwrap()
         .start()
@@ -126,12 +127,10 @@ async fn counter_decrements_on_err_dead_exit() {
     tokio::time::sleep(Duration::from_secs(5)).await;
     let _ = handle.shutdown(Duration::from_secs(10)).await;
 
-    let dead: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pgwq.jobs WHERE status = 'dead'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let dead: i64 = sqlx::query_scalar("SELECT count(*) FROM pgwq.jobs WHERE status = 'dead'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         dead, 5,
         "all keyed jobs reached dead -> counter decremented on the Err exit",

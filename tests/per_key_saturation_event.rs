@@ -150,8 +150,7 @@ async fn per_key_saturation_emits_pgwq_claim_event() {
     let sat_event = captured.iter().find(|e| {
         // Accept both the exact message string and its Debug-quoted variant.
         e.message.contains("per-key concurrency saturated")
-            || e.message
-                .contains("\"per-key concurrency saturated\"")
+            || e.message.contains("\"per-key concurrency saturated\"")
     });
 
     assert!(
