@@ -59,6 +59,23 @@ async fn concurrency_key_column_and_objects_present() {
     .await
     .expect("trigger existence query must succeed");
     assert!(trigger_exists, "immutability trigger must exist");
+
+    // jobs_claim_idx has an INCLUDE (concurrency_key) covering column.
+    let indexdef: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = 'pgwq' AND indexname = 'jobs_claim_idx'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("jobs_claim_idx must exist");
+    assert!(
+        indexdef.contains("INCLUDE"),
+        "jobs_claim_idx must use an INCLUDE clause; got: {indexdef}"
+    );
+    assert!(
+        indexdef.contains("concurrency_key"),
+        "jobs_claim_idx INCLUDE clause must cover concurrency_key; got: {indexdef}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
