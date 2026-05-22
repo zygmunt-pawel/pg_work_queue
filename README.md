@@ -1207,7 +1207,7 @@ your existing pipeline (`tracing-subscriber`, OpenTelemetry, etc.).
 | `pgwq.state.transition` | `ERROR` / `INFO` / `DEBUG` | every flip of `pgwq.jobs.status` (worker, reaper, or purge — purge emits an aggregate, not per-row) | `worker.id`, `job.id`, `job.public_id`, `queue`, `job.attempts`, `status.from`, `status.to`, `source` (`"worker"` / `"reaper"` / `"purge"`), `lost_race`, `reason` (omitted at ERROR for PII safety — only `reason_length` + `reason_present`) |
 | `pgwq.tick_once` | `INFO` span | `Worker::tick_once` | `queue`, `batch_size`, `claimed`, `completed`, `failed`, `fenced_out` |
 | `pgwq.poll_tick` | `INFO` span | each poll loop tick | `worker.id`, `queue`, `batch_size`, `claimed` |
-| `pgwq.claim` | `DEBUG` | the set of saturated (headroom-0) `concurrency_limits` keys changed since the previous tick | `worker.id`, `queue`, `saturated_keys` |
+| `pgwq.claim` | `DEBUG` | the set of saturated (headroom-0) `concurrency_limits` keys changed **and is non-empty** (de-saturation to an empty set is silent) | `worker.id`, `queue`, `saturated_keys` |
 | `pgwq.handle_job` | `INFO` span | each handler invocation | `worker.id`, `queue`, `job.id`, `job.public_id`, `job.attempt`, `timeout_ms` |
 | `pgwq.handler.timeout_elapsed` | `WARN` | `handler_timeout` fired | `worker.id`, `job.id`, `job.public_id`, `job.attempt`, `timeout_ms` |
 | `pgwq.retry_in.clamped` | `WARN` | per-call `retry_in` was outside `[max(poll_interval, 100ms), 24h]` | `requested_ms`, `applied_ms` |
@@ -1217,11 +1217,12 @@ your existing pipeline (`tracing-subscriber`, OpenTelemetry, etc.).
 | `pgwq.purge` | `INFO` | aggregate, once per `purge_done` / `purge_dead` call | `status`, `age_secs`, `deleted` |
 
 The `pgwq.claim` saturation event is **edge-triggered** — it fires only
-when the set of saturated keys *changes* between ticks, not on every tick
-a key is saturated. A steady-state saturated key emits nothing, so a
-subscriber that attaches after saturation began sees no event until the
-set next changes. Use it to detect saturation transitions, not as a
-continuously-polled gauge.
+when the set of saturated keys *changes* between ticks **and the new set
+is non-empty**. Saturation onset and changes between non-empty saturated
+sets are logged; the set clearing to empty (de-saturation) is silent.
+A steady-state saturated key emits nothing, so a subscriber that attaches
+after saturation began sees no event until the set next changes. Use it
+to detect saturation transitions, not as a continuously-polled gauge.
 
 `tracing::instrument` is also placed on `Pusher::push*` (`fields(queue =
 %self.queue)`) and on every `mark_*` SQL (`fields(job.id = id)`) so
