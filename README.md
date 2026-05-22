@@ -35,6 +35,7 @@ at two distinct values.
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
 - [Delivery semantics: at-least-once](#delivery-semantics-at-least-once)
+- [Per-key concurrency](#per-key-concurrency)
 - [State machine and schema](#state-machine-and-schema)
 - [API reference](#api-reference)
   - [`migrator()`](#migrator)
@@ -161,13 +162,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .start()
         .await?;
 
-    // 3) Push jobs from your own transaction.
+    // 3) Push jobs from your own transaction. The trailing `None` is the
+    //    optional per-key concurrency key — see "Per-key concurrency".
     let mut tx = pool.begin().await?;
     let _id = Pusher::new("email_send")
         .push(&mut tx, &EmailTask {
             to: "a@b.example".into(),
             body: "hello".into(),
-        })
+        }, None)
         .await?;
     tx.commit().await?;
 
@@ -223,12 +225,16 @@ Five components, all crate-internal except `Pusher` and `Worker`:
    - **Acquire permits first** (semaphore, capacity = `concurrency`). The
      loop only claims as many rows as it has free permits → no spawn
      backlog.
-   - Run `claim_batch` CTE: `FOR UPDATE SKIP LOCKED` on up to
+   - Run the claim CTE: `FOR UPDATE SKIP LOCKED` on up to
      `min(batch_size, free_permits)` rows whose status is `queued` or
      `awaiting_retry` and `run_at <= now()`, then `UPDATE … status =
      'running'`, increment `attempts`, stamp `lease_token` (v4),
      `lease_expires_at = now() + lease_timeout`, and `max_attempts =
-     <worker's max>`.
+     <worker's max>`. With no `concurrency_limits` configured this is
+     the plain `claim_batch` CTE; with limits configured the loop
+     instead runs a per-key bounded keyed claim that respects each
+     key's remaining headroom (see [Per-key
+     concurrency](#per-key-concurrency)).
    - Decode each payload through the configured `Codec` inside
      `catch_unwind` — codec panic or decode error → `mark_dead`
      immediately, row dropped from the batch.
@@ -272,6 +278,14 @@ Five components, all crate-internal except `Pusher` and `Worker`:
 - **No worker registration table.** The reaper sees only
   `lease_expires_at` + `lease_token` per row. This avoids the
   apalis-style "reaper-joined-to-purged-worker-row" race entirely.
+- **Two claim paths, one chosen per worker.** With no
+  `concurrency_limits` configured the poll loop runs the plain
+  `claim_batch` CTE (a single `(queue, run_at, id)` range scan). With
+  limits configured it runs a per-key bounded *keyed claim* — the CTE
+  takes a per-key headroom map and claims at most `headroom` rows per
+  key, so a saturated key contributes nothing. The branch is decided by
+  whether the headroom map is empty; `tick_once` always passes an empty
+  map. See [Per-key concurrency](#per-key-concurrency).
 
 ## Delivery semantics: at-least-once
 
@@ -407,6 +421,131 @@ Same shape works for "try fallback DNS resolver only on last attempt",
 "accept stale cache on last attempt instead of regenerating", or
 "insert into manual-review table once before dead-lettering".
 
+## Per-key concurrency
+
+`WorkerBuilder::concurrency` is one process-wide cap over the whole
+handler. **Per-key concurrency** adds a second, narrower axis: cap how
+many jobs of a given *kind* run at once — e.g. one job kind hits a
+rate-limited external API, another is heavy and must not be flooded.
+
+### The model
+
+- A job carries an **optional `concurrency_key: Option<&str>`**, stamped
+  once at enqueue (`Pusher::push` / `push_at` / `push_batch`), and
+  **immutable** for the job's lifetime (a DB trigger rejects any later
+  `UPDATE` of the column). `None` = no limit (the pre-feature behavior).
+  Keys are opaque, byte-exact (`COLLATE "C"`), case-sensitive, not
+  trimmed.
+- Limits are **worker configuration**: `WorkerBuilder::concurrency_limits`
+  takes a `key → limit` map. A key present on a job but absent from the
+  map is unlimited; a `None` key is unlimited.
+- For a configured `(queue, concurrency_key)` pair, **at most `limit`
+  handler tasks execute concurrently**.
+
+### Claim-time gating (no head-of-line blocking)
+
+The cap is applied **at claim time, not after**. A naive in-handler
+semaphore would be wrong: the job is already `running` and leased, so
+surplus jobs would park on the semaphore, occupy `Worker` permits,
+starve other job kinds (head-of-line blocking), and burn
+`attempts` / lease. Instead, the worker simply **does not claim** a job
+whose key is saturated — the row stays `queued`, and `Worker` permits
+stay free for other keys. Each poll tick the worker computes
+`headroom = limit − running_count` per configured key and the keyed
+claim CTE claims at most `headroom` rows per key. Cross-key allocation
+within a tick stays global `(run_at, id)` FIFO; a saturated key simply
+contributes zero rows until a slot frees.
+
+### The guarantee surface: live handler tasks, not `running` rows
+
+The bound is over **live handler tasks in this process**, tracked by an
+in-memory counter — *not* over rows in `status = 'running'`. A slot is
+consumed when a handler task is spawned and released (via an RAII guard)
+when that task exits, regardless of the `mark_*` outcome. A row can be
+`running` in the database with no live handler behind it (a crash ghost)
+— such a row consumes no real resource, and the worker does not count it.
+
+### Single-instance / single-`Worker`-object assumption
+
+Per-key counting lives in **process memory**, so the limit is only
+correct under **exactly one `Worker` object driving the queue**:
+
+- Running **2+ `Worker` processes or objects** against the same queue
+  silently multiplies the effective limit — each driver counts only its
+  own tasks, so N drivers admit up to `N × limit`.
+- `Worker::tick_once` does **not** enforce per-key limits — it claims via
+  the plain `claim_batch` path with an empty headroom map. Running
+  `tick_once` against a queue that a `start()`ed `Worker` also drives
+  defeats the limit.
+
+This is a deliberate v0.1 trade-off: DB-coordinated counting would need a
+`running`-row aggregate plus MVCC-race handling. The rest of the crate's
+machinery (reaper, fencing tokens, `SKIP LOCKED`) is crash-recovery, not
+clustering — it is unaffected and a single instance needs it just as much.
+
+### After a crash: no counter seed
+
+The counter is **never seeded from the database**; it starts at zero for
+every configured key. After a previous process crashed, rows it left in
+`status = 'running'` are ghosts — their handlers died with that process.
+The fresh worker correctly runs up to `limit` *new* tasks. The database
+may therefore **transiently show more than `limit` rows in
+`status = 'running'`** (ghosts + live tasks) — this is stale metadata,
+not real over-execution; the reaper reclaims the ghosts within
+`≤ lease_timeout + reaper_interval`.
+
+### Non-cooperative handlers hold their slot
+
+`handler_timeout` is cooperative — a CPU-bound handler with no `.await`
+is not cancelled and may run past `lease_timeout` (see [Cancellation
+gotcha](#cancellation-gotcha-cpu-bound-work)). Its key slot is held the
+whole time it runs — correct, since the work *is* still running.
+Meanwhile the reaper may reclaim that job's row to `awaiting_retry` and
+the poll loop may re-claim it, acquiring a *second* slot for a second
+task of the same job — so the key is transiently double-counted. This is
+in the safe direction (a conservative over-count → under-admission) and
+self-heals once the stuck task ends.
+
+### Usage
+
+```rust
+# use pg_work_queue::{Worker, JobError, JobContext, Pusher};
+# use serde::{Deserialize, Serialize};
+# #[derive(Serialize, Deserialize)]
+# struct ApiCall { endpoint: String }
+# async fn run(pool: sqlx::PgPool) -> Result<(), Box<dyn std::error::Error>> {
+// Worker: cap each key independently. `stripe` -> at most 2 concurrent
+// handler tasks; `s3-bulk` -> at most 8. A job whose key is not listed
+// here (or whose key is `None`) is unlimited.
+let worker = Worker::<ApiCall>::builder()
+    .pool(pool.clone())
+    .queue("api_calls")
+    .concurrency_limits([
+        ("stripe".to_string(), 2),
+        ("s3-bulk".to_string(), 8),
+    ])
+    .handler(|task: ApiCall, _ctx: JobContext| async move {
+        call(&task).await.map_err(JobError::retry)?;
+        Ok(())
+    })
+    .build()?;
+
+// Pusher: stamp the key at enqueue time (4th argument of `push`).
+let mut tx = pool.begin().await?;
+Pusher::new("api_calls")
+    .push(&mut tx, &ApiCall { endpoint: "/charges".into() }, Some("stripe"))
+    .await?;
+tx.commit().await?;
+# let _ = worker;
+# Ok(())
+# }
+# async fn call(_t: &ApiCall) -> Result<(), String> { Ok(()) }
+```
+
+Per-key limits and the worker-wide `concurrency` are **independent
+axes** — there is no cross-knob constraint between them. A per-key limit
+larger than `concurrency` simply means the worker-wide cap binds first.
+
 ## State machine and schema
 
 ```
@@ -465,25 +604,48 @@ CREATE TABLE pgwq.jobs (
     run_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    concurrency_key    TEXT COLLATE "C",   -- NULL = no per-key limit
     /* + CHECK constraints, see below */
 );
 ```
 
+`concurrency_key` is nullable and **immutable after insert** — see
+[Per-key concurrency](#per-key-concurrency). It is orthogonal to the
+status FSM (not part of `jobs_status_invariants`).
+
 Indexes (all partial):
 
-- `jobs_claim_idx (queue, run_at, id) WHERE status IN ('queued',
-  'awaiting_retry')` — claim hot path.
+- `jobs_claim_idx (queue, run_at, id) INCLUDE (concurrency_key) WHERE
+  status IN ('queued', 'awaiting_retry')` — claim hot path. The
+  `(queue, run_at, id)` KEY prefix is byte-identical to the pre-feature
+  index (global FIFO order and the plain `claim_batch` range scan are
+  unaffected — `INCLUDE` columns live only in leaf pages); the covering
+  `concurrency_key` lets the keyed claim's anti-join filter without a
+  heap fetch.
+- `jobs_claim_conc_idx (queue, concurrency_key, run_at, id) WHERE status
+  IN ('queued', 'awaiting_retry')` — per-key bounded claim hot path. The
+  leading `(queue, concurrency_key)` equality makes each per-key range
+  scan Sort-free.
 - `jobs_reap_idx (queue, lease_expires_at) WHERE status = 'running'` —
   reaper hot path; `queue` first so a per-queue reaper scans only its
   slice.
 - `jobs_terminal_idx (finished_at) WHERE status IN ('done', 'dead')` —
   purge hot path.
 
+Each enqueue and each `running → awaiting_retry` transition now
+maintains **both** claim indexes (`jobs_claim_idx` and
+`jobs_claim_conc_idx` share the partial predicate) — ~2× claim-index
+entry churn versus the pre-feature schema. Inherent cost of the feature.
+
 CHECK constraints (defense-in-depth — library validates pre-INSERT too):
 
 - `jobs_queue_nonempty` / `jobs_queue_max_len` (≤ 64).
 - `jobs_payload_max_size` (`octet_length(payload) ≤ 1 MiB`).
 - `jobs_last_error_max_len` (≤ 8 KiB chars).
+- `jobs_concurrency_key_len` — `concurrency_key` is `NULL` or
+  `1..=128` characters. Added `NOT VALID` (every pre-existing row is
+  `NULL`, so the unscanned rows are provably valid); still enforced on
+  every future `INSERT` / `UPDATE`.
 - `jobs_attempts_nonneg`, `jobs_max_attempts_nonneg`.
 - `jobs_temporal` — monotonic timestamps (`first_attempted_at ≥
   created_at`, `last_attempted_at ≥ first_attempted_at`,
@@ -492,6 +654,18 @@ CHECK constraints (defense-in-depth — library validates pre-INSERT too):
 - `jobs_status_invariants` — full FSM coherence; e.g. `status =
   'running'` ⇔ `lease_token IS NOT NULL AND lease_expires_at IS NOT
   NULL`.
+
+Triggers:
+
+- `set_updated_at` — `BEFORE UPDATE`, touches `updated_at`.
+- `assert_concurrency_key_immutable` — `BEFORE UPDATE`, raises an
+  exception if `concurrency_key` changes between `OLD` and `NEW`. The
+  crate's own claim / mark / reaper UPDATEs never name `concurrency_key`
+  in their `SET` lists, so for them the trigger is inert; its real
+  purpose is to reject an external hand-rolled `UPDATE pgwq.jobs SET
+  concurrency_key = …` that would desync the in-memory per-key counter.
+  `BEFORE UPDATE` only, so the `NULL → value` `INSERT` at enqueue is
+  allowed.
 
 Table storage parameters:
 
@@ -538,9 +712,9 @@ infallible; the check fires on each push call.
 |---|---|---|
 | `new` | `Pusher::new(queue: impl Into<String>) -> Self` | Default `JsonCodec`. |
 | `with_codec` | `fn with_codec<C2: Codec>(self, codec: C2) -> Pusher<C2>` | Swap the codec, keep the queue name. |
-| `push` | `async fn push<T: Serialize + Sync>(&self, tx: &mut PgConnection, payload: &T) -> Result<Uuid, PushError>` | Single insert, `run_at = now()`. Returns the row's `public_id` (UUIDv7 generated client-side). |
-| `push_at` | `async fn push_at<T: Serialize + Sync>(&self, tx, payload, run_at: DateTime<Utc>) -> Result<Uuid, PushError>` | Same as `push`, but explicit `run_at`. |
-| `push_batch` | `async fn push_batch<T: Serialize + Sync>(&self, tx, payloads: &[T]) -> Result<Vec<Uuid>, PushError>` | One round-trip insert via `INSERT … SELECT … FROM unnest($1::bytea[], $2::uuid[])`. Returns IDs in input order. |
+| `push` | `async fn push<T: Serialize + Sync>(&self, tx: &mut PgConnection, payload: &T, concurrency_key: Option<&str>) -> Result<Uuid, PushError>` | Single insert, `run_at = now()`. Returns the row's `public_id` (UUIDv7 generated client-side). |
+| `push_at` | `async fn push_at<T: Serialize + Sync>(&self, tx, payload, run_at: DateTime<Utc>, concurrency_key: Option<&str>) -> Result<Uuid, PushError>` | Same as `push`, but explicit `run_at`. |
+| `push_batch` | `async fn push_batch<T: Serialize + Sync>(&self, tx, items: &[(T, Option<String>)]) -> Result<Vec<Uuid>, PushError>` | One round-trip insert via `INSERT … SELECT … FROM unnest($2::bytea[], $3::uuid[], $4::text[])`. Each item is a `(payload, concurrency_key)` pair. Returns IDs in input order. |
 
 All four take `tx: &mut PgConnection` so they participate in the
 caller's transaction — the job insert commits atomically with your
@@ -548,18 +722,38 @@ business writes, or rolls back together. There is no autocommit
 convenience overload; if you want one, write a 3-line wrapper:
 
 ```rust
+# async fn run<T: serde::Serialize + Sync>(
+#     pool: sqlx::PgPool, pusher: pg_work_queue::Pusher, payload: T,
+# ) -> Result<(), Box<dyn std::error::Error>> {
 let mut tx = pool.begin().await?;
-let id = pusher.push(&mut tx, &payload).await?;
+let id = pusher.push(&mut tx, &payload, None).await?;
 tx.commit().await?;
+# let _ = id;
+# Ok(())
+# }
 ```
 
-Validation order in `push_batch`:
+`concurrency_key` is the optional per-key concurrency bucket — `None`
+for "no limit" (the common case). See [Per-key
+concurrency](#per-key-concurrency). A `Some(key)` must be `1..=128`
+**characters** (`MAX_CONCURRENCY_KEY_LEN`) or the push fails with
+`PushError::ConcurrencyKeyInvalid`. The key bytes do **not** count
+toward `MAX_BATCH_BYTES` (which budgets payloads only).
+
+Validation order on every push (`push` / `push_at` / per-item in
+`push_batch`):
 1. `validate_queue` — empty or > 64 chars → `PushError::QueueNameInvalid`.
-2. `payloads.is_empty()` → `PushError::BatchEmpty`.
-3. `payloads.len() > MAX_BATCH_SIZE` (10 000) → `PushError::BatchTooLarge`.
-4. Per-item: codec → `PushError::BatchCodec { index, .. }`; size
+2. `concurrency_key` — `Some` key empty or > 128 chars →
+   `PushError::ConcurrencyKeyInvalid` (checked *before* the codec encode
+   step — it is cheap and should fail before any encoding work).
+3. Codec encode + size — codec failure → `PushError::Codec` (single) /
+   `PushError::BatchCodec { index, .. }` (batch); encoded size
    `> MAX_PAYLOAD_BYTES` (1 MiB) → `PushError::PayloadTooLarge`.
-5. Aggregate size `> MAX_BATCH_BYTES` (64 MiB) →
+
+`push_batch` adds, around the per-item loop:
+1. `payloads.is_empty()` → `PushError::BatchEmpty`.
+2. `items.len() > MAX_BATCH_SIZE` (10 000) → `PushError::BatchTooLarge`.
+3. Aggregate size `> MAX_BATCH_BYTES` (64 MiB) →
    `PushError::BatchPayloadTooLarge` (short-circuit — we never buffer
    multi-GB transient data only to fail at the end).
 
@@ -598,6 +792,7 @@ produces a sensible runtime.
 | `panic_policy(p)` | no | `Retry` | — | terminal status on panic | — |
 | `poll_interval(d)` | no | 1s | 10ms floor | pickup latency upper bound | `PollIntervalTooShort` |
 | `concurrency(n)` | no | `available_parallelism()` (fallback 4) | ≥ 1 | parallel handler slots | `ConcurrencyZero`, `PoolTooSmall` |
+| `concurrency_limits(map)` | no | empty | each key 1..=128 chars; each limit 1..=`i32::MAX` | per-key concurrent-task cap | `ConcurrencyKeyInvalid`, `ConcurrencyLimitInvalid` |
 | `handler_timeout(d)` | no | `lease × 0.8`, clamped to ≥ 1s | 1s floor; `handler + 1s ≤ lease` | per-handler wall clock | `HandlerTimeoutBelowFloor`, `HandlerTimeoutTooLong` |
 | `mark_timeout(d)` | no | `lease − handler − 1s`, clamped to ≥ 100ms | 100ms floor; `≤ lease − handler` | per-`mark_*` SQL wait | `MarkTimeoutTooShort`, `MarkTimeoutTooLong` |
 | `reaper_interval(d)` | no | `lease / 4`, clamped to ≥ 1s | 1s floor; `≤ lease / 2` | reaper tick cadence | `ReaperIntervalTooShort`, `ReaperIntervalTooLong` |
@@ -628,6 +823,19 @@ produces a sensible runtime.
   either size the shared pool to the joint floor, or give each worker
   its own pool.
 
+`concurrency_limits` takes any `IntoIterator<Item = (String, u32)>`
+(a `HashMap`, a `Vec`, an array literal). It **accumulates** across
+calls; a duplicate key — within one call or across calls — takes the
+**last** value and emits a `tracing::warn!` on target `pgwq.builder` at
+the point of the overwriting `.concurrency_limits()` call (the warning
+may be dropped if no subscriber is installed yet). Keys and limits are
+validated at `build()`: each key must be `1..=128` characters
+(`ConcurrencyKeyInvalid`), each limit must be `1..=i32::MAX`
+(`ConcurrencyLimitInvalid { key, limit }`). There is **no** cross-knob
+constraint with `concurrency` — the two are independent axes. See
+[Per-key concurrency](#per-key-concurrency) for the runtime semantics
+and the single-instance assumption.
+
 `BuildError` is `#[non_exhaustive]` so new constraints can be added
 without a breaking change.
 
@@ -640,8 +848,10 @@ pub async fn tick_once(&self) -> Result<TickStats, sqlx::Error>;
 Single-shot — claim a batch, run each handler **sequentially**, flip
 each row with the fencing-token guard. Intentionally simple: it does
 **not** use `handler_timeout` / `mark_timeout` wrappers, and a handler
-panic bubbles up through `.await`. Use for tests and ad-hoc scripts;
-use `start()` for production.
+panic bubbles up through `.await`. It also does **not** enforce
+`concurrency_limits` — it claims via the plain `claim_batch` path; per-key
+limiting is a property of the `start()` poll loop only. Use for tests and
+ad-hoc scripts; use `start()` for production.
 
 #### `Worker::start`
 
@@ -925,14 +1135,13 @@ println!("running = {}, dead = {}", stats.running, stats.dead);
 
 ### Error types
 
-All error enums are `#[non_exhaustive]` (except `PushError`, where new
-variants would always be additive but the type was left exhaustive for
-v0.1; treat it as `#[non_exhaustive]` for forward-compat).
+All error enums are `#[non_exhaustive]` — new variants can be added
+without a breaking change.
 
 | enum | when it surfaces |
 |---|---|
-| `PushError` | `Pusher::push*`. Includes `is_retriable()` helper — `true` only for `Transient` (network/IO/pool); everything else is a deterministic caller-bug-style error. SQLSTATE class `23` (integrity) is classified as `Constraint`. |
-| `BuildError` | `WorkerBuilder::build`. Covers every per-knob constraint plus cross-knob invariants and `Pool*` mismatches. |
+| `PushError` | `Pusher::push*`. Includes `is_retriable()` helper — `true` only for `Transient` (network/IO/pool); everything else is a deterministic caller-bug-style error. SQLSTATE class `23` (integrity) is classified as `Constraint`. `ConcurrencyKeyInvalid(String)` carries the offending key when a `concurrency_key` is empty or > 128 characters. |
+| `BuildError` | `WorkerBuilder::build`. Covers every per-knob constraint plus cross-knob invariants and `Pool*` mismatches. `ConcurrencyKeyInvalid(String)` — a `concurrency_limits` key is empty or > 128 characters. `ConcurrencyLimitInvalid { key, limit }` — a limit is outside `1..=2147483647` (Display: `concurrency limit for key {key:?} must be in 1..=2147483647, got {limit}`). |
 | `StartError` | `Worker::start`. `SchemaMissing` is the loud-fail surface for `42P01` / `3F000` (schema or table missing); other sqlx errors come through `Database`. |
 | `ShutdownError` | `WorkerHandle::{join, shutdown}`. `Fatal(Arc<sqlx::Error>)` for fatal classifier hits in poll/reaper **and** for poll loops that exceeded `MAX_CONSECUTIVE_CLAIM_ERRORS` non-fatal errors in a row (the most recent error becomes the payload); `ReaperPanicEscalation { consecutive_panics }` for the reaper's 3-strikes self-shutdown. `Timeout` and `AlreadyShutdown` are reserved for v0.2 (the current API consumes `self` so they're unreachable in practice). |
 | `PurgeError` | `purge_done` / `purge_dead` / `queue_stats`. Single `Database(sqlx::Error)` variant; left `#[non_exhaustive]` so future versions may classify retriable-vs-fatal without breaking callers. |
@@ -975,6 +1184,7 @@ constant has a matching DB CHECK or builder validation):
 | `MAX_BATCH_SIZE` | 10 000 |
 | `MAX_BATCH_BYTES` | 64 MiB |
 | `MAX_QUEUE_LEN` | 64 |
+| `MAX_CONCURRENCY_KEY_LEN` | 128 (characters — Postgres `length(TEXT)` units) |
 | `MAX_LAST_ERROR_LEN` | 8 KiB chars |
 | `MIN_POLL_INTERVAL` | 10 ms |
 | `MIN_HANDLER_TIMEOUT` | 1 s |
@@ -997,6 +1207,7 @@ your existing pipeline (`tracing-subscriber`, OpenTelemetry, etc.).
 | `pgwq.state.transition` | `ERROR` / `INFO` / `DEBUG` | every flip of `pgwq.jobs.status` (worker, reaper, or purge — purge emits an aggregate, not per-row) | `worker.id`, `job.id`, `job.public_id`, `queue`, `job.attempts`, `status.from`, `status.to`, `source` (`"worker"` / `"reaper"` / `"purge"`), `lost_race`, `reason` (omitted at ERROR for PII safety — only `reason_length` + `reason_present`) |
 | `pgwq.tick_once` | `INFO` span | `Worker::tick_once` | `queue`, `batch_size`, `claimed`, `completed`, `failed`, `fenced_out` |
 | `pgwq.poll_tick` | `INFO` span | each poll loop tick | `worker.id`, `queue`, `batch_size`, `claimed` |
+| `pgwq.claim` | `DEBUG` | the set of saturated (headroom-0) `concurrency_limits` keys changed since the previous tick | `worker.id`, `queue`, `saturated_keys` |
 | `pgwq.handle_job` | `INFO` span | each handler invocation | `worker.id`, `queue`, `job.id`, `job.public_id`, `job.attempt`, `timeout_ms` |
 | `pgwq.handler.timeout_elapsed` | `WARN` | `handler_timeout` fired | `worker.id`, `job.id`, `job.public_id`, `job.attempt`, `timeout_ms` |
 | `pgwq.retry_in.clamped` | `WARN` | per-call `retry_in` was outside `[max(poll_interval, 100ms), 24h]` | `requested_ms`, `applied_ms` |
@@ -1004,6 +1215,13 @@ your existing pipeline (`tracing-subscriber`, OpenTelemetry, etc.).
 | `pgwq.shutdown` | `INFO` | end of `WorkerHandle::shutdown` | all `Stats` fields + `elapsed_ms` |
 | `pgwq.shutdown.pending_recovery_failed` / `_timed_out` | `WARN` | best-effort `pending_recovery` query failed | `worker.id`, `queue`, `error` / `timeout_ms` |
 | `pgwq.purge` | `INFO` | aggregate, once per `purge_done` / `purge_dead` call | `status`, `age_secs`, `deleted` |
+
+The `pgwq.claim` saturation event is **edge-triggered** — it fires only
+when the set of saturated keys *changes* between ticks, not on every tick
+a key is saturated. A steady-state saturated key emits nothing, so a
+subscriber that attaches after saturation began sees no event until the
+set next changes. Use it to detect saturation transitions, not as a
+continuously-polled gauge.
 
 `tracing::instrument` is also placed on `Pusher::push*` (`fields(queue =
 %self.queue)`) and on every `mark_*` SQL (`fields(job.id = id)`) so
@@ -1125,6 +1343,33 @@ Defensive escape hatches if either caveat bites:
 - **Stats can be off by 1–2 under aggressive shutdown.** Documented
   in `Stats`'s rustdoc — a `mark_done` UPDATE may commit server-side
   while its future is cancelled before bumping `completed`.
+- **Per-key concurrency is single-instance only.** `concurrency_limits`
+  is enforced via an in-process counter, so the limit is correct only
+  under exactly one `Worker` object driving the queue. 2+ workers (or a
+  `tick_once` caller alongside a `start()`ed worker) silently multiply
+  the effective limit. See [Per-key
+  concurrency](#per-key-concurrency).
+- **The concurrency-key migration takes `ACCESS EXCLUSIVE` on
+  `pgwq.jobs` for its full duration.** `sqlx` runs each migration file
+  in one transaction, and the
+  `20260521000000_v01_concurrency_key.sql` migration builds two indexes
+  non-`CONCURRENTLY` (`sqlx`'s one-transaction-per-file model precludes
+  `CREATE INDEX CONCURRENTLY`). The lock blocks **reads and writes**
+  (claims, marks, the reaper, pushes). On a queue table kept small by
+  purging — the expected case — the whole migration is sub-second. On a
+  large unpurged table it is a full read+write stall proportional to row
+  count (order of seconds to minutes at, say, 1M+ rows). Purge before
+  migrating a hot, large table.
+- **Head-of-queue skew in the keyed claim.** When `concurrency_limits`
+  is configured, the keyed claim's unlimited-rows scan walks
+  `(run_at, id)`-ordered rows and anti-joins out configured keys. If a
+  *saturated* configured key owns a large block of the **oldest** rows,
+  that scan skips past all of them — `O(rows-skipped)` index entries per
+  tick (cheap per entry, no heap fetch: ~30 MB of index pages at a
+  skewed 1M-row backlog while saturation persists). This is largely moot
+  when every job carries a configured key (the unlimited scan is then
+  near-empty); it only bites a workload that mixes configured-key jobs
+  with many unkeyed/unconfigured-key jobs. Not fixed in v0.1.
 
 ## Testing
 
