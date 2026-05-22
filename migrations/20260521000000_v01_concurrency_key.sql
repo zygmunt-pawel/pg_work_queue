@@ -31,9 +31,15 @@ CREATE INDEX jobs_claim_idx
 
 -- Per-key bounded claim. Leading (queue, concurrency_key) equality makes
 -- each per-key LATERAL a tight (run_at, id) range scan with no Sort node.
+-- The `concurrency_key IS NOT NULL` predicate keeps NULL-key rows (jobs that
+-- never opt into the feature) out of this index — they are claimed via the
+-- plain `jobs_claim_idx` path, so indexing them here is pure write-
+-- amplification. The keyed claim is unaffected: `j.concurrency_key =
+-- hr.concurrency_key` implies non-NULL, so this partial index stays usable.
 CREATE INDEX jobs_claim_conc_idx
     ON pgwq.jobs (queue, concurrency_key, run_at, id)
-    WHERE status IN ('queued', 'awaiting_retry');
+    WHERE status IN ('queued', 'awaiting_retry')
+          AND concurrency_key IS NOT NULL;
 
 -- Immutability guard — a SEPARATE single-purpose trigger (not folded into
 -- pgwq.set_updated_at). BEFORE UPDATE only, so INSERT (NULL -> value at
@@ -44,8 +50,12 @@ CREATE FUNCTION pgwq.assert_concurrency_key_immutable()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
     IF OLD.concurrency_key IS DISTINCT FROM NEW.concurrency_key THEN
+        -- ERRCODE 23514 (check_violation, SQLSTATE class 23) so a stray
+        -- `UPDATE ... SET concurrency_key` classifies as FATAL via
+        -- `is_fatal_sqlx` instead of an infinite transient warn loop.
         RAISE EXCEPTION
-            'pgwq.jobs.concurrency_key is immutable (job id %)', OLD.id;
+            'pgwq.jobs.concurrency_key is immutable (job id %)', OLD.id
+            USING ERRCODE = '23514';
     END IF;
     RETURN NEW;
 END;

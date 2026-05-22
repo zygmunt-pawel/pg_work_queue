@@ -72,6 +72,19 @@ j.concurrency_key";
 // Per-key bounded claim SQL (non-empty headroom — design spec §5).
 // Headroom map bound as jsonb ($5); keys without an entry are claimed
 // without a per-key cap (eligible_unlimited branch).
+//
+// CORRECTNESS — the two-stage shape (unlocked `eligible_keyed` /
+// `eligible_unlimited` CTEs that rank+LIMIT the candidate set, then a
+// SEPARATE `locked` CTE that applies `FOR UPDATE SKIP LOCKED`) is
+// deliberate and relies on the crate's single-`Worker`-per-queue
+// assumption. The per-key `LIMIT` MUST rank against the true ordered
+// candidate rows WITHOUT `SKIP LOCKED`: if `SKIP LOCKED` were pushed
+// into the LATERAL, rows locked by an in-flight transaction would be
+// skipped during ranking, the LIMIT would admit *further* rows to refill
+// the cap, and the per-key concurrency limit would be over-admitted.
+// Do NOT "optimize" by folding `FOR UPDATE SKIP LOCKED` into the
+// `eligible_*` CTEs — that reintroduces the over-admit bug. The lock is
+// applied only afterward, in `locked`.
 const SQL_KEYED: &str = "WITH
  hr AS (
      SELECT key AS concurrency_key, value::int AS h

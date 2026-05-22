@@ -40,6 +40,22 @@ async fn keyed_claim_respects_headroom_limit_2() {
     assert_eq!(jobs.len(), 2);
 }
 
+// Sibling at a second distinct headroom value (CLAUDE.md: each builder knob
+// tested at two distinct values). Headroom 1 -> claims exactly 1 row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyed_claim_respects_headroom_limit_1() {
+    let (pool, _c) = pg18_pool().await;
+    push_n_keyed(&pool, "q", "k", 10).await;
+
+    let headroom: HashMap<String, u32> = [("k".to_string(), 1u32)].into();
+    let jobs = pg_work_queue::__test_exports::claim_and_decode::<T, _>(
+        &pool, &JsonCodec, "q", 32, Duration::from_secs(30), 3, &headroom,
+    )
+    .await
+    .unwrap();
+    assert_eq!(jobs.len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_claim_saturated_key_claims_zero() {
     let (pool, _c) = pg18_pool().await;

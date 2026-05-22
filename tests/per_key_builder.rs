@@ -12,7 +12,13 @@
 //! czysto-synchroniczne. Pool jest required (builder demand'uje), ale
 //! `PgPool` można zbudować bez połączenia przez `PgPoolOptions::new().connect_lazy(...)`.
 
+use std::sync::{Arc, Mutex};
+
 use sqlx::postgres::PgPoolOptions;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::Registry;
 
 use pg_work_queue::{BuildError, JobContext, JobError, Worker};
 use serde::{Deserialize, Serialize};
@@ -84,4 +90,65 @@ async fn concurrency_limit_too_large_rejected() {
         .build()
         .unwrap_err();
     assert!(matches!(err, BuildError::ConcurrencyLimitInvalid { .. }));
+}
+
+/// Records the message of every event whose target is `pgwq.builder`.
+struct BuilderWarnCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+struct MsgVisitor {
+    message: Option<String>,
+}
+
+impl Visit for MsgVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = Some(format!("{value:?}"));
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for BuilderWarnCapture {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        if event.metadata().target() != "pgwq.builder" {
+            return;
+        }
+        let mut v = MsgVisitor { message: None };
+        event.record(&mut v);
+        if let Some(m) = v.message {
+            self.messages.lock().unwrap().push(m);
+        }
+    }
+}
+
+/// A duplicate `concurrency_limits` key takes the LAST value and emits a
+/// `pgwq.builder` warn. Two separate `.concurrency_limits([...])` calls set
+/// `("k", 1)` then `("k", 5)`; the build succeeds (last-wins, no error) and
+/// the duplicate-key warn is captured.
+#[tokio::test]
+async fn duplicate_concurrency_key_last_wins_and_warns() {
+    let messages = Arc::new(Mutex::new(Vec::<String>::new()));
+    let layer = BuilderWarnCapture {
+        messages: messages.clone(),
+    };
+    let subscriber = Registry::default().with(layer);
+
+    let built = tracing::subscriber::with_default(subscriber, || {
+        builder(dummy_pool())
+            .concurrency_limits([("k".to_string(), 1u32)])
+            .concurrency_limits([("k".to_string(), 5u32)])
+            .handler(ok_handler)
+            .build()
+    });
+
+    assert!(built.is_ok(), "duplicate key is last-wins, build must succeed");
+
+    let captured = messages.lock().unwrap().clone();
+    assert!(
+        captured
+            .iter()
+            .any(|m| m.contains("duplicate key overwritten")),
+        "expected a pgwq.builder duplicate-key warn; got: {captured:?}",
+    );
 }

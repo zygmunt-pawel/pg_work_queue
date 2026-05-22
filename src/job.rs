@@ -1,10 +1,7 @@
 //! `Job<T>` (decoded claimed row) and `JobContext` (handler argument).
 //!
-//! See PLAN.md §"`JobContext` (handler argument)" and §"Faza 2".
-//!
 //! `JobContext` is constructed by `Worker` from a `Job<T>` before invoking
-//! the user handler — see Faza 3+. In Faza 2 only the type defs land;
-//! `Worker` is still a stub.
+//! the user handler.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;

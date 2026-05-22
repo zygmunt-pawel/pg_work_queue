@@ -1,7 +1,5 @@
 //! Mark queries — terminal/transitional state-machine transitions for a
-//! *claimed* row.
-//!
-//! Faza 3: pełny zestaw `mark_done` / `mark_retry` / `mark_dead`.
+//! *claimed* row: the full `mark_done` / `mark_retry` / `mark_dead` set.
 //!
 //! Every `mark_*` SQL carries the **fencing-token guard** (`status='running'
 //! AND lease_token = $token`) per PLAN.md §"Mark queries (fencing token w
@@ -23,9 +21,9 @@ use uuid::Uuid;
 ///
 /// # Errors
 /// Propagates any `sqlx::Error` from the underlying execute (pool starvation,
-/// network drop, etc.). Caller decides whether to retry (Faza 2: callers in
-/// `claim_and_decode` just warn-and-continue; row stays `running` and the
-/// reaper recovers it after lease expiration).
+/// network drop, etc.). Caller decides whether to retry — callers in
+/// `claim_and_decode` just warn-and-continue; the row stays `running` and the
+/// reaper recovers it after lease expiration.
 #[tracing::instrument(skip(pool, reason), fields(job.id = id))]
 pub async fn mark_dead(
     pool: &PgPool,

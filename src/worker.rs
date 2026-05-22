@@ -1,4 +1,4 @@
-//! Worker — `tick_once` (Faza 3) + `start()` poll loop (Faza 4).
+//! Worker — `tick_once` single-shot + `start()` poll loop.
 //!
 //! `Worker<T, C>` is generic over the payload type and the codec. The
 //! builder uses the type-state pattern (`H` for handler) so a missing
@@ -9,7 +9,7 @@
 //! `tick_once` is a single-shot: `claim_batch` → run handlers **sequential**
 //! → `mark_done` / `mark_retry` / `mark_dead` z fencing token w WHERE.
 //!
-//! `start()` (Faza 4) spawns the poll loop + a `JoinSet` of in-flight
+//! `start()` spawns the poll loop + a `JoinSet` of in-flight
 //! handlers; returns a [`WorkerHandle`] for cancel/join. Architectural rule:
 //! **acquire permits FIRST, then claim only what permits allow** (PLAN.md
 //! lines 573-685, Anti-pattern #13).
@@ -859,8 +859,8 @@ where
 }
 
 /// Single-queue worker with a configured handler. Build via
-/// [`Worker::builder()`]; drive via [`Worker::tick_once`] (Faza 3) or
-/// [`Worker::start`] (Faza 4).
+/// [`Worker::builder()`]; drive via [`Worker::tick_once`] or
+/// [`Worker::start`].
 pub struct Worker<T, C = JsonCodec> {
     pool: PgPool,
     queue: String,
@@ -918,9 +918,12 @@ where
     /// Run a single tick: claim a batch, run each handler sequentially,
     /// flip terminal/transitional state with fencing token in WHERE.
     ///
-    /// `tick_once` does NOT use the Faza 4 `handler_timeout` / `mark_timeout`
-    /// wrappers — it is a deliberately simple single-shot. Use [`Worker::start`]
-    /// for the production poll loop.
+    /// `tick_once` does NOT use the `handler_timeout` / `mark_timeout`
+    /// wrappers — it is a deliberately simple single-shot. It also does NOT
+    /// enforce per-key concurrency limits configured via
+    /// [`WorkerBuilder::concurrency_limits`]: those are applied only by the
+    /// [`Worker::start`] poll loop. Use [`Worker::start`] for the production
+    /// poll loop.
     ///
     /// # Errors
     /// Propagates only the `sqlx::Error` from `claim_batch`. Per-row
@@ -928,7 +931,7 @@ where
     /// after lease expiry).
     ///
     /// # Panics
-    /// Faza 3: handler panic propagates up through `.await`. Use `start()`
+    /// A handler panic propagates up through `.await`. Use `start()`
     /// for `JoinSet` panic isolation.
     #[tracing::instrument(
         name = "pgwq.tick_once",
@@ -1124,7 +1127,7 @@ pub(crate) struct WorkerState<T, C> {
 /// variant is reserved for future API revisions).
 ///
 /// - [`WorkerHandle::join`] — wait for natural exit (cancel + drain). No
-///   timeout; no Stats. Kept for back-compat with Faza 4 surface.
+///   timeout; no Stats.
 /// - [`WorkerHandle::shutdown`] — preferred for production. Bounded shutdown
 ///   with hard-abort cascade + best-effort `Stats` snapshot.
 ///
@@ -1192,11 +1195,11 @@ impl WorkerHandle {
 
     /// Await poll loop + reaper loop completion, then drain in-flight handlers.
     ///
-    /// Drains the local handler `JoinSet` until empty. Faza 7 adds two
-    /// new error variants:
+    /// Drains the local handler `JoinSet` until empty. Can fail with two
+    /// error variants:
     ///   - [`ShutdownError::Fatal`] — fatal `sqlx::Error` in poll or reaper.
     ///   - [`ShutdownError::ReaperPanicEscalation`] — reaper hit the panic
-    ///     threshold (Faza 5 surface gap is closed here).
+    ///     threshold.
     ///
     /// `Fatal` takes precedence over `ReaperPanicEscalation` if both fire.
     ///
@@ -1588,44 +1591,53 @@ where
         //
         // Per-tick headroom snapshot: limit − live-task count, per configured
         // key. The map always contains every configured key (headroom >= 0).
-        // Poisoned mutex (unreachable in practice — counter critical sections are
-        // panic-free, so the mutex cannot actually be poisoned): fall back to
-        // empty headroom map, which skips per-key limit enforcement for this tick
-        // (jobs may be claimed past their per-key concurrency limit) and lets
-        // claim_batch proceed on the global semaphore headroom alone.
-        let headroom: std::collections::HashMap<String, u32> = state
-            .concurrency_running
-            .lock()
-            .map_or_else(
-                |_| std::collections::HashMap::new(),
-                |counts| {
-                    state
-                        .concurrency_limits
-                        .iter()
-                        .map(|(k, &limit)| {
-                            let used = counts.get(k).copied().unwrap_or(0);
-                            (k.clone(), limit.saturating_sub(used))
-                        })
-                        .collect()
-                },
-            );
-        let saturated: std::collections::BTreeSet<String> = headroom
-            .iter()
-            .filter(|&(_, &h)| h == 0)
-            .map(|(k, _)| k.clone())
-            .collect();
-        if saturated != prev_saturated {
-            if !saturated.is_empty() {
-                tracing::event!(
-                    target: "pgwq.claim",
-                    tracing::Level::DEBUG,
-                    worker.id = %state.worker_id,
-                    queue = %state.queue,
-                    saturated_keys = ?saturated,
-                    "per-key concurrency saturated",
-                );
+        //
+        // Non-feature workers (no `concurrency_limits` configured) skip the
+        // snapshot entirely — building a throwaway empty HashMap + BTreeSet
+        // every tick is pure waste. They pass an empty headroom to the claim,
+        // which routes to the unbounded plain claim path.
+        //
+        // Poisoned mutex (unreachable in practice — counter critical sections
+        // are panic-free, so the mutex cannot actually be poisoned): RECOVER
+        // the inner `HashMap` via `into_inner` rather than failing open. A
+        // poisoned `std::Mutex` over a plain map is safe to recover, and
+        // recovery is strictly correct vs. silently dropping per-key limits.
+        let headroom: std::collections::HashMap<String, u32> =
+            if state.concurrency_limits.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let counts = state
+                    .concurrency_running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state
+                    .concurrency_limits
+                    .iter()
+                    .map(|(k, &limit)| {
+                        let used = counts.get(k).copied().unwrap_or(0);
+                        (k.clone(), limit.saturating_sub(used))
+                    })
+                    .collect()
+            };
+        if !state.concurrency_limits.is_empty() {
+            let saturated: std::collections::BTreeSet<String> = headroom
+                .iter()
+                .filter(|&(_, &h)| h == 0)
+                .map(|(k, _)| k.clone())
+                .collect();
+            if saturated != prev_saturated {
+                if !saturated.is_empty() {
+                    tracing::event!(
+                        target: "pgwq.claim",
+                        tracing::Level::DEBUG,
+                        worker.id = %state.worker_id,
+                        queue = %state.queue,
+                        saturated_keys = ?saturated,
+                        "per-key concurrency saturated",
+                    );
+                }
+                prev_saturated = saturated;
             }
-            prev_saturated = saturated;
         }
         let claim_result = tokio::select! {
             r = crate::claim::claim_and_decode::<T, C>(
@@ -1894,7 +1906,7 @@ async fn handle_job<T, C>(
 }
 
 /// Apply a handler `Result<(), JobError>` to the DB via mark_* with the
-/// Faza-4 `mark_timeout` wrapper + stats counters + transition events.
+/// `mark_timeout` wrapper + stats counters + transition events.
 #[allow(clippy::too_many_arguments)]
 async fn apply_handler_result_state<T, C>(
     state: &WorkerState<T, C>,

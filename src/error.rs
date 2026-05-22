@@ -190,10 +190,9 @@ impl JobError {
 
 /// Errors produced by `WorkerBuilder::build()` for invalid configuration.
 ///
-/// Faza 4 adds variants for `poll_interval`, `concurrency`,
-/// `handler_timeout`, `mark_timeout` knobs and `PoolMissing` /
-/// `PoolTooSmall` / `LeaseTimeoutTooShort`. `ReaperIntervalTooLong` lands
-/// in Faza 5 (PLAN.md lines 1395-1425).
+/// Covers the `poll_interval`, `concurrency`, `handler_timeout` and
+/// `mark_timeout` knobs, the `PoolMissing` / `PoolTooSmall` /
+/// `LeaseTimeoutTooShort` pool checks, and `ReaperIntervalTooLong`.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum BuildError {
@@ -374,12 +373,12 @@ pub enum StartError {
 /// Errors returned by [`crate::worker::WorkerHandle::join`] /
 /// [`crate::worker::WorkerHandle::shutdown`].
 ///
-/// `Fatal` lands w Faza 4 — fired when the poll loop or reaper classifies a
-/// `sqlx::Error` as fatal via `is_fatal_sqlx` and self-shuts down. Faza 7 adds
-/// `Timeout`, `AlreadyShutdown` (reserved for v0.2 — drop-time double-shutdown
-/// detection) and `ReaperPanicEscalation` (programmatic surface for the Phase 5
-/// reaper-panic-threshold escalation; previously observable only via
-/// `tracing::error!`).
+/// `Fatal` is fired when the poll loop or reaper classifies a `sqlx::Error`
+/// as fatal via `is_fatal_sqlx` and self-shuts down. `Timeout` reports a
+/// drain that overran `shutdown(timeout)`; `AlreadyShutdown` is reserved for
+/// v0.2 drop-time double-shutdown detection; `ReaperPanicEscalation` is the
+/// programmatic surface for the reaper-panic-threshold escalation (otherwise
+/// observable only via `tracing::error!`).
 ///
 /// Precedence when multiple terminal conditions fire concurrently: `Fatal` wins
 /// over `ReaperPanicEscalation` wins over `Timeout`.
@@ -388,7 +387,7 @@ pub enum StartError {
 pub enum ShutdownError {
     /// Worker self-shut-down after a fatal `sqlx::Error` in the poll loop or
     /// reaper. `Arc<sqlx::Error>` because `WorkerState::last_fatal` is shared
-    /// with other observers (Faza 7 `Stats` snapshot).
+    /// with other observers (the `Stats` snapshot).
     #[error("worker failed with fatal error: {0}")]
     Fatal(Arc<sqlx::Error>),
 

@@ -623,19 +623,27 @@ Indexes (all partial):
   `concurrency_key` lets the keyed claim's anti-join filter without a
   heap fetch.
 - `jobs_claim_conc_idx (queue, concurrency_key, run_at, id) WHERE status
-  IN ('queued', 'awaiting_retry')` — per-key bounded claim hot path. The
-  leading `(queue, concurrency_key)` equality makes each per-key range
-  scan Sort-free.
+  IN ('queued', 'awaiting_retry') AND concurrency_key IS NOT NULL` —
+  per-key bounded claim hot path. The leading `(queue, concurrency_key)`
+  equality makes each per-key range scan Sort-free. The
+  `concurrency_key IS NOT NULL` predicate keeps NULL-key rows (jobs that
+  never opt into the feature) out of this index — they claim via
+  `jobs_claim_idx` instead, so indexing them here would be pure
+  write-amplification. The keyed claim is unaffected: its
+  `j.concurrency_key = hr.concurrency_key` join implies non-NULL.
 - `jobs_reap_idx (queue, lease_expires_at) WHERE status = 'running'` —
   reaper hot path; `queue` first so a per-queue reaper scans only its
   slice.
 - `jobs_terminal_idx (finished_at) WHERE status IN ('done', 'dead')` —
   purge hot path.
 
-Each enqueue and each `running → awaiting_retry` transition now
-maintains **both** claim indexes (`jobs_claim_idx` and
-`jobs_claim_conc_idx` share the partial predicate) — ~2× claim-index
-entry churn versus the pre-feature schema. Inherent cost of the feature.
+Each enqueue and each `running → awaiting_retry` transition of a
+**keyed** job now maintains **both** claim indexes (`jobs_claim_idx`
+unconditionally, `jobs_claim_conc_idx` only for non-NULL
+`concurrency_key`) — up to ~2× claim-index entry churn for keyed jobs
+versus the pre-feature schema. Jobs with `concurrency_key = NULL` (the
+common case) touch only `jobs_claim_idx`, as before. Inherent cost of
+the feature.
 
 CHECK constraints (defense-in-depth — library validates pre-INSERT too):
 
@@ -1135,8 +1143,11 @@ println!("running = {}, dead = {}", stats.running, stats.dead);
 
 ### Error types
 
-All error enums are `#[non_exhaustive]` — new variants can be added
-without a breaking change.
+Every library-surfaced error enum is `#[non_exhaustive]` — new variants
+can be added without a breaking change. `JobError` is the exception: it
+is exhaustive by design, because handler code *constructs* it (a
+`#[non_exhaustive]` enum cannot be constructed outside its defining
+crate).
 
 | enum | when it surfaces |
 |---|---|

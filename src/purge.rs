@@ -98,6 +98,7 @@ async fn purge_terminal(
     }
 
     tracing::info!(
+        target: "pgwq.purge",
         status = %status_label,
         age_secs = age.as_secs(),
         deleted = total,
